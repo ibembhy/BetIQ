@@ -654,6 +654,7 @@ def get_current_odds(team_name: str = None) -> dict:
             "home_team":     home,
             "away_team":     away,
             "best_lines":    best,
+            "books":         best.get("books", {}),
         }
         games.append(game)
 
@@ -662,6 +663,7 @@ def get_current_odds(team_name: str = None) -> dict:
 
 def _save_odds_snapshot(home: str, away: str, best_lines: dict):
     """Persist current odds to DB for line movement tracking. Called inside get_current_odds."""
+    import json
     try:
         ml      = best_lines.get("moneyline", {})
         spread  = best_lines.get("spread", {})
@@ -681,6 +683,7 @@ def _save_odds_snapshot(home: str, away: str, best_lines: dict):
             "total_line":         over_info.get("point"),
             "over_price":         over_info.get("price"),
             "under_price":        under_info.get("price"),
+            "bookmaker_odds":     json.dumps(best_lines.get("books", {})),
         })
     except Exception:
         pass  # Never block odds fetching on a snapshot failure
@@ -764,10 +767,14 @@ def get_line_movement(team_name: str) -> dict:
 
 
 def _extract_best_lines(event: dict) -> dict:
-    h2h: dict   = {}
+    h2h: dict    = {}
     spread: dict = {}
     total: dict  = {}
+    books: dict  = {}
+
     for bm in event.get("bookmakers", []):
+        bm_title = bm.get("title", bm.get("key", "Unknown"))
+        bm_data: dict = {}
         for market in bm.get("markets", []):
             key = market["key"]
             for outcome in market.get("outcomes", []):
@@ -777,13 +784,19 @@ def _extract_best_lines(event: dict) -> dict:
                 if key == "h2h":
                     if name not in h2h or (price is not None and price > h2h[name]):
                         h2h[name] = price
+                    bm_data[f"ml_{name}"] = price
                 elif key == "spreads":
                     if name not in spread:
                         spread[name] = {"price": price, "point": point}
+                    bm_data[f"spread_{name}"] = f"{point:+.1f} ({fo(price)})" if point is not None else None
                 elif key == "totals":
                     if name not in total:
                         total[name] = {"price": price, "point": point}
-    return {"moneyline": h2h, "spread": spread, "total": total}
+                    bm_data[f"total_{name}"] = f"{point} ({fo(price)})" if point is not None else fo(price)
+        if bm_data:
+            books[bm_title] = bm_data
+
+    return {"moneyline": h2h, "spread": spread, "total": total, "books": books}
 
 
 def get_advanced_stats(team_name: str, season: int = None) -> dict:

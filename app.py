@@ -595,11 +595,13 @@ with tab_today:
         games_today = t.get_todays_games().get("games", [])
         odds_today  = t.get_current_odds().get("games", [])
 
-    # Build odds lookup: lower(home_team) → best_lines
-    odds_map = {}
+    # Build odds lookup: lower(home_team) → best_lines + per-book data
+    odds_map  = {}
+    books_map = {}
     for og in odds_today:
         key = og.get("home_team", "").lower()
-        odds_map[key] = og.get("best_lines", {})
+        odds_map[key]  = og.get("best_lines", {})
+        books_map[key] = og.get("books", {})
 
     # Build agent-bet lookup: games with open bets
     open_picks = {}  # lower matchup keyword → list of bet dicts
@@ -770,6 +772,29 @@ with tab_today:
             )
 
             st.markdown(card, unsafe_allow_html=True)
+
+            # ── Book comparison expander ──
+            book_data = books_map.get(home.lower(), {})
+            if book_data:
+                with st.expander(f"📊 Line comparison — {len(book_data)} book(s)"):
+                    rows = []
+                    for book_name, bd in book_data.items():
+                        home_ml = bd.get(f"ml_{home}")
+                        away_ml = bd.get(f"ml_{away}")
+                        rows.append({
+                            "Book":        book_name,
+                            f"{away} ML":  fo(away_ml) if away_ml else "—",
+                            f"{home} ML":  fo(home_ml) if home_ml else "—",
+                            f"{away} Spread": bd.get(f"spread_{away}", "—") or "—",
+                            f"{home} Spread": bd.get(f"spread_{home}", "—") or "—",
+                            "Over":  bd.get("total_Over",  "—") or "—",
+                            "Under": bd.get("total_Under", "—") or "—",
+                        })
+                    if rows:
+                        st.dataframe(
+                            pd.DataFrame(rows).set_index("Book"),
+                            use_container_width=True,
+                        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

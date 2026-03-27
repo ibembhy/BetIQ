@@ -84,7 +84,12 @@ def init_db():
         try:
             c.execute(f"ALTER TABLE bets ADD COLUMN {col} {definition}")
         except Exception:
-            pass  # Column already exists
+            pass
+
+    try:
+        c.execute("ALTER TABLE odds_snapshots ADD COLUMN bookmaker_odds TEXT")
+    except Exception:
+        pass  # Column already exists
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS candidate_bets (
@@ -282,8 +287,8 @@ def save_odds_snapshot(home_team: str, away_team: str, snapshot: dict):
             (captured_at, home_team, away_team,
              home_ml, away_ml,
              home_spread, home_spread_price, away_spread_price,
-             total_line, over_price, under_price)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?)
+             total_line, over_price, under_price, bookmaker_odds)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             datetime.now(timezone.utc).isoformat(),
@@ -292,7 +297,7 @@ def save_odds_snapshot(home_team: str, away_team: str, snapshot: dict):
             snapshot.get("home_spread"), snapshot.get("home_spread_price"),
             snapshot.get("away_spread_price"),
             snapshot.get("total_line"), snapshot.get("over_price"),
-            snapshot.get("under_price"),
+            snapshot.get("under_price"), snapshot.get("bookmaker_odds"),
         ),
     )
     conn.commit()
