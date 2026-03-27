@@ -788,11 +788,11 @@ def _extract_best_lines(event: dict) -> dict:
                 elif key == "spreads":
                     if name not in spread:
                         spread[name] = {"price": price, "point": point}
-                    bm_data[f"spread_{name}"] = f"{point:+.1f} ({fo(price)})" if point is not None else None
+                    bm_data[f"spread_{name}"] = {"point": point, "price": price}
                 elif key == "totals":
                     if name not in total:
                         total[name] = {"price": price, "point": point}
-                    bm_data[f"total_{name}"] = f"{point} ({fo(price)})" if point is not None else fo(price)
+                    bm_data[f"total_{name}"] = {"point": point, "price": price}
         if bm_data:
             books[bm_title] = bm_data
 

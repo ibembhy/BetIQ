@@ -777,18 +777,28 @@ with tab_today:
             book_data = books_map.get(home.lower(), {})
             if book_data:
                 with st.expander(f"📊 Line comparison — {len(book_data)} book(s)"):
+                    def _fmt_spread(d):
+                        if not d or not isinstance(d, dict): return "—"
+                        pt, pr = d.get("point"), d.get("price")
+                        return f"{pt:+.1f} ({fo(pr)})" if pt is not None and pr is not None else "—"
+
+                    def _fmt_total(d):
+                        if not d or not isinstance(d, dict): return "—"
+                        pt, pr = d.get("point"), d.get("price")
+                        return f"{pt} ({fo(pr)})" if pt is not None and pr is not None else "—"
+
                     rows = []
                     for book_name, bd in book_data.items():
                         home_ml = bd.get(f"ml_{home}")
                         away_ml = bd.get(f"ml_{away}")
                         rows.append({
-                            "Book":        book_name,
-                            f"{away} ML":  fo(away_ml) if away_ml else "—",
-                            f"{home} ML":  fo(home_ml) if home_ml else "—",
-                            f"{away} Spread": bd.get(f"spread_{away}", "—") or "—",
-                            f"{home} Spread": bd.get(f"spread_{home}", "—") or "—",
-                            "Over":  bd.get("total_Over",  "—") or "—",
-                            "Under": bd.get("total_Under", "—") or "—",
+                            "Book":           book_name,
+                            f"{away} ML":     fo(away_ml) if away_ml is not None else "—",
+                            f"{home} ML":     fo(home_ml) if home_ml is not None else "—",
+                            f"{away} Spread": _fmt_spread(bd.get(f"spread_{away}")),
+                            f"{home} Spread": _fmt_spread(bd.get(f"spread_{home}")),
+                            "Over":           _fmt_total(bd.get("total_Over")),
+                            "Under":          _fmt_total(bd.get("total_Under")),
                         })
                     if rows:
                         st.dataframe(
