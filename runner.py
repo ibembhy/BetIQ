@@ -34,7 +34,7 @@ logging.basicConfig(
     format="%(asctime)s  %(levelname)-8s  %(message)s",
     handlers=[
         logging.FileHandler("runner.log", encoding="utf-8"),
-        logging.StreamHandler(sys.stdout),
+        logging.StreamHandler(open(sys.stdout.fileno(), mode='w', encoding='utf-8', closefd=False)),
     ],
 )
 log = logging.getLogger("betiq")
@@ -44,15 +44,20 @@ EST = pytz.timezone("America/New_York")
 # Global scheduler reference (set in __main__, used by late_scan)
 scheduler = None
 
-# ── Scan prompt ───────────────────────────────────────────────────────────────
+# ── Per-game prompt ────────────────────────────────────────────────────────────
 
-SCAN_PROMPT = (
-    "Scan all of today's NBA games. For each game, gather the full analysis "
-    "(team stats, recent form, home/away splits, rest days, injuries, head-to-head, "
-    "and current odds). Identify any bets with a 5%+ edge and place them if bankroll "
-    "rules allow. Also resolve any open bets from previous games. "
-    "Report what you found and what actions you took."
-)
+def _game_prompt(home: str, away: str) -> str:
+    return (
+        f"Analyse the game: {away} @ {home}. "
+        "Before analysing, call get_notes and get_bet_history to load context, "
+        "then call get_bankroll and resolve_bets. "
+        "Gather the full analysis: team stats, season stats, recent form, home/away splits, "
+        "rest days, injuries, head-to-head, current odds, book discrepancies, "
+        "public betting percentages, and line movement for both teams. "
+        "If you find a bet with 5%+ edge and bankroll rules allow, place it. "
+        "Otherwise log a candidate bet with the reason. "
+        "Report what you found and what action you took."
+    )
 
 # ── Core scan function ─────────────────────────────────────────────────────────
 
@@ -63,6 +68,14 @@ def run_scan(label: str) -> None:
     # Check if there are any NBA games today before burning API calls
     games = t.get_todays_games()
     game_count = games.get("count", 0)
+
+    if "error" in games:
+        log.error(f"Could not fetch games: {games['error']}")
+        t._send_notification(
+            title="BetIQ Scan Error",
+            message=f"{label} scan ({now}): Could not fetch games — {games['error']}",
+        )
+        return
 
     if game_count == 0:
         log.info("No NBA games today — skipping scan.")
@@ -78,19 +91,32 @@ def run_scan(label: str) -> None:
         message=f"Starting analysis of {game_count} game(s)...",
     )
 
+    # Resolve open bets once before game loop
     try:
-        response, _, _ = run_agent(SCAN_PROMPT, conversation_history=[])
-        log.info(f"{label} scan complete.\n{response}")
-        t._send_notification(
-            title=f"BetIQ {label} Scan Complete",
-            message=response[:3000],  # Telegram max ~4096 chars
-        )
+        t.resolve_bets()
     except Exception as exc:
-        log.error(f"{label} scan failed: {exc}")
-        t._send_notification(
-            title="BetIQ Scan Error",
-            message=f"{label} scan failed: {exc}",
-        )
+        log.warning(f"Pre-scan resolve failed: {exc}")
+
+    summaries = []
+    for game in games.get("games", []):
+        home = game.get("home_team", "Home")
+        away = game.get("visitor_team", "Away")
+        matchup = f"{away} @ {home}"
+        log.info(f"Analysing {matchup}...")
+        try:
+            response, _, _ = run_agent(_game_prompt(home, away), conversation_history=[])
+            log.info(f"{matchup} done.\n{response}")
+            summaries.append(f"• {matchup}: {response[:300]}")
+        except Exception as exc:
+            log.error(f"{matchup} failed: {exc}")
+            summaries.append(f"• {matchup}: ERROR — {exc}")
+
+    summary = f"{label} scan complete. {game_count} game(s) analysed.\n\n" + "\n\n".join(summaries)
+    log.info(summary)
+    t._send_notification(
+        title=f"BetIQ {label} Scan Complete",
+        message=summary[:3000],
+    )
 
 
 # ── Late resolve (resolve-only, no agent call) ─────────────────────────────────
@@ -206,15 +232,13 @@ if __name__ == "__main__":
     scheduler.add_job(afternoon_scan, "cron", hour=14, minute=0)
     # 6:00 PM EST — injury reports in, best pre-game window
     scheduler.add_job(evening_scan,   "cron", hour=18, minute=0)
-    # 9:30 PM EST — west coast games, resolve early games
-    scheduler.add_job(late_scan,      "cron", hour=21, minute=30)
 
-    log.info("BetIQ runner started. Scans scheduled at 2:00 PM, 6:00 PM, 9:30 PM EST.")
+    log.info("BetIQ runner started. Scans scheduled at 2:00 PM, 6:00 PM EST.")
     log.info("Press Ctrl+C to stop.")
 
     t._send_notification(
         title="BetIQ Runner Started",
-        message="Autonomous scanner is running.\nScans at 2:00 PM, 6:00 PM, 9:30 PM EST.\nYou'll be notified of every bet placed and resolved.",
+        message="Autonomous scanner is running.\nScans at 2:00 PM, 6:00 PM EST.\nYou'll be notified of every bet placed and resolved.",
     )
 
     try:

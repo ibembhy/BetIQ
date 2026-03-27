@@ -4,10 +4,12 @@ BetIQ — Agentic loop with extended thinking and tool use.
 
 import json
 import os
-from anthropic import Anthropic
+import time
+from anthropic import Anthropic, RateLimitError
 from dotenv import load_dotenv
 
 import tools as t
+import database as db
 
 load_dotenv()
 
@@ -445,6 +447,7 @@ TOOLS = [
             },
             "required": [],
         },
+        "cache_control": {"type": "ephemeral"},
     },
 ]
 
@@ -507,34 +510,51 @@ def run_agent(
     all_thinking: list[str] = []
 
     while True:
-        # ── Call the model ────────────────────────────────────────────────────
-        try:
-            response = client.messages.create(
-                model="claude-sonnet-4-6",
-                max_tokens=16000,
-                thinking={"type": "enabled", "budget_tokens": 8000},
-                system=SYSTEM_PROMPT,
-                tools=TOOLS,
-                messages=messages,
-                betas=["interleaved-thinking-2025-05-14"],
-            )
-        except Exception:
-            # Fallback: no extended thinking (older SDK / network issue)
-            response = client.messages.create(
-                model="claude-sonnet-4-6",
-                max_tokens=8000,
-                system=SYSTEM_PROMPT,
-                tools=TOOLS,
-                messages=messages,
-            )
+        # ── Call the model (with rate-limit retry) ───────────────────────────
+        response = None
+        for attempt in range(6):
+            try:
+                response = client.messages.create(
+                    model="claude-sonnet-4-6",
+                    max_tokens=5000,
+                    thinking={"type": "enabled", "budget_tokens": 2000},
+                    system=[{"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}],
+                    tools=TOOLS,
+                    messages=messages,
+                )
+                break
+            except RateLimitError:
+                wait = 60 * (attempt + 1)
+                print(f"Rate limit hit — waiting {wait}s before retry {attempt + 1}/6...", flush=True)
+                time.sleep(wait)
+            except Exception:
+                # Fallback: no extended thinking (older SDK / network issue)
+                for fb_attempt in range(6):
+                    try:
+                        response = client.messages.create(
+                            model="claude-sonnet-4-6",
+                            max_tokens=5000,
+                            system=[{"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}],
+                            tools=TOOLS,
+                            messages=messages,
+                        )
+                        break
+                    except RateLimitError:
+                        wait = 60 * (fb_attempt + 1)
+                        print(f"Rate limit hit (fallback) — waiting {wait}s...", flush=True)
+                        time.sleep(wait)
+                break
+        if response is None:
+            raise RuntimeError("API rate limit exceeded after all retries.")
 
         # ── Collect thinking blocks ───────────────────────────────────────────
         for block in response.content:
             if block.type == "thinking":
                 all_thinking.append(block.thinking)
 
-        # ── Add assistant turn to history (preserve thinking blocks) ─────────
-        messages.append({"role": "assistant", "content": response.content})
+        # ── Add assistant turn to history (strip thinking blocks to save tokens) ─
+        history_content = [b for b in response.content if b.type != "thinking"]
+        messages.append({"role": "assistant", "content": history_content})
 
         # ── End of turn ───────────────────────────────────────────────────────
         if response.stop_reason == "end_turn":
@@ -563,3 +583,84 @@ def run_agent(
         break
 
     return "Agent loop ended unexpectedly.", messages, all_thinking
+
+
+# ── Lite agent (Haiku, DB-only, for floating chat widget) ─────────────────────
+
+_LITE_SYSTEM = """You are BetIQ Assistant. Answer questions about the user's paper betting account.
+You can read bet history, bankroll, agent notes, and near-miss bets.
+Be direct and short — under 120 words. Use numbers and facts. No NBA analysis, no predictions."""
+
+_LITE_TOOLS = [
+    {
+        "name": "get_bankroll",
+        "description": "Current balance, open bets count, and slots remaining.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "get_bet_history",
+        "description": "All past picks with outcomes, P&L, and win rate.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "get_notes",
+        "description": "Lessons and patterns the agent saved from previous scans.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"limit": {"type": "integer", "description": "Max notes (default 10)."}},
+            "required": [],
+        },
+    },
+    {
+        "name": "get_candidate_bets",
+        "description": "Near-miss bets the agent considered but chose not to place.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"limit": {"type": "integer", "description": "Max to return (default 20)."}},
+            "required": [],
+        },
+    },
+]
+
+_LITE_DISPATCH = {
+    "get_bankroll":       lambda a: t.get_bankroll(),
+    "get_bet_history":    lambda a: t.get_bet_history(),
+    "get_notes":          lambda a: t.get_notes(**a),
+    "get_candidate_bets": lambda a: db.get_candidate_bets(limit=a.get("limit", 20)),
+}
+
+
+def run_lite_agent(user_message: str, conversation_history: list) -> tuple[str, list, list]:
+    """Cheap Haiku agent with DB-only tools for the in-app floating chat widget."""
+    messages = conversation_history + [{"role": "user", "content": user_message}]
+
+    for _ in range(10):
+        response = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=800,
+            system=_LITE_SYSTEM,
+            tools=_LITE_TOOLS,
+            messages=messages,
+        )
+        messages.append({"role": "assistant", "content": response.content})
+
+        if response.stop_reason == "end_turn":
+            text = " ".join(
+                b.text for b in response.content if getattr(b, "type", None) == "text"
+            ).strip() or "Done."
+            return text, messages, []
+
+        if response.stop_reason == "tool_use":
+            results = []
+            for block in response.content:
+                if block.type == "tool_use":
+                    fn = _LITE_DISPATCH.get(block.name)
+                    try:
+                        out = fn(block.input) if fn else {"error": f"Unknown tool: {block.name}"}
+                        content = json.dumps(out, default=str)
+                    except Exception as exc:
+                        content = json.dumps({"error": str(exc)})
+                    results.append({"type": "tool_result", "tool_use_id": block.id, "content": content})
+            messages.append({"role": "user", "content": results})
+
+    return "Couldn't complete that request.", messages, []

@@ -11,7 +11,8 @@ from datetime import datetime
 import database as db
 import tools as t
 import reporter
-from agent import run_agent
+import html as _html
+from agent import run_agent, run_lite_agent
 
 load_dotenv()
 db.init_db()
@@ -592,8 +593,33 @@ with tab_today:
     st.markdown(f"### {today_str}")
 
     with st.spinner("Loading today's games…"):
-        games_today = t.get_todays_games().get("games", [])
-        odds_today  = t.get_current_odds().get("games", [])
+        odds_result = t.get_current_odds()
+        odds_today  = odds_result.get("games", [])
+
+        bdl_result  = t.get_todays_games()
+        if "error" not in bdl_result:
+            games_today = bdl_result.get("games", [])
+        else:
+            # BallDontLie unavailable — build game list from Odds API
+            from datetime import timezone as _tz
+            def _fmt_tip(iso: str) -> str:
+                try:
+                    from datetime import datetime as _dt
+                    dt = _dt.fromisoformat(iso.replace("Z", "+00:00"))
+                    return dt.astimezone().strftime("%-I:%M %p")
+                except Exception:
+                    return ""
+            games_today = [
+                {
+                    "home_team":        og["home_team"],
+                    "visitor_team":     og["away_team"],
+                    "status":           "",
+                    "home_team_score":  0,
+                    "visitor_team_score": 0,
+                    "time":             _fmt_tip(og.get("commence_time", "")),
+                }
+                for og in odds_today
+            ]
 
     # Build odds lookup: lower(home_team) → best_lines + per-book data
     odds_map  = {}
@@ -612,22 +638,22 @@ with tab_today:
     if not games_today:
         st.info("No NBA games scheduled today.")
     else:
-        # Fetch team records (cached after first call)
+        # Fetch team records — skip quietly if BallDontLie is down
         all_teams_today = {g["home_team"] for g in games_today} | {g["visitor_team"] for g in games_today}
         records = {}
         with st.spinner("Fetching team records…"):
             for team in all_teams_today:
-                ts = t.get_team_stats(team)
-                rec = ts.get("record", {})
-                if rec:
-                    records[team] = f"{rec.get('wins', 0)}-{rec.get('losses', 0)}"
-                else:
+                try:
+                    ts = t.get_team_stats(team)
+                    rec = ts.get("record", {})
+                    records[team] = f"{rec.get('wins', 0)}-{rec.get('losses', 0)}" if rec else "—"
+                except Exception:
                     records[team] = "—"
 
         for g in games_today:
             home    = g["home_team"]
             away    = g["visitor_team"]
-            status  = g.get("status", "Scheduled")
+            status  = g.get("status", "")
             h_score = g.get("home_team_score", 0)
             a_score = g.get("visitor_team_score", 0)
             gtime   = g.get("time", "")
@@ -1248,3 +1274,141 @@ with tab_replaced:
                 </div>
 
             </div>""", unsafe_allow_html=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# FLOATING LITE CHAT WIDGET
+# ═══════════════════════════════════════════════════════════════════════════════
+
+if "lite_msgs" not in st.session_state:
+    st.session_state.lite_msgs = []
+if "lite_hist" not in st.session_state:
+    st.session_state.lite_hist = []
+
+# Process a message submitted via ?lm= query param
+_lm = st.query_params.get("lm", "")
+if _lm:
+    try:
+        _resp, _hist, _ = run_lite_agent(_lm, st.session_state.lite_hist)
+        st.session_state.lite_hist = _hist[-20:]
+    except Exception as _exc:
+        _resp = f"Error: {_exc}"
+    st.session_state.lite_msgs.append({"role": "user",      "content": _lm})
+    st.session_state.lite_msgs.append({"role": "assistant", "content": _resp})
+    if len(st.session_state.lite_msgs) > 40:
+        st.session_state.lite_msgs = st.session_state.lite_msgs[-40:]
+    st.query_params.clear()
+
+# Build messages HTML
+_msgs_html = ""
+for _m in st.session_state.lite_msgs[-14:]:
+    _cls  = "lcm-user" if _m["role"] == "user" else "lcm-bot"
+    _text = _html.escape(str(_m["content"]))
+    _msgs_html += f'<div class="lcm {_cls}">{_text}</div>'
+if not _msgs_html:
+    _msgs_html = '<div class="lcm lcm-bot">Ask me about your bets, bankroll, or performance! 🏀</div>'
+
+st.markdown(f"""
+<style>
+#betiq-fab {{
+    position:fixed; bottom:24px; left:24px;
+    width:52px; height:52px; background:#3b82f6;
+    border-radius:50%; display:flex; align-items:center;
+    justify-content:center; cursor:pointer; z-index:9998;
+    box-shadow:0 4px 16px rgba(59,130,246,.45);
+    font-size:1.4rem; transition:transform .2s,box-shadow .2s;
+    user-select:none;
+}}
+#betiq-fab:hover {{ transform:scale(1.08); box-shadow:0 6px 20px rgba(59,130,246,.6); }}
+#betiq-cp {{
+    position:fixed; bottom:88px; left:24px; width:320px;
+    background:#1a1a2e; border:1px solid #3b3b6b; border-radius:16px;
+    z-index:9999; display:none; flex-direction:column;
+    box-shadow:0 8px 32px rgba(0,0,0,.55); overflow:hidden;
+    font-family:'Inter',sans-serif;
+}}
+#betiq-cp.open {{ display:flex; }}
+.lc-hdr {{
+    background:#252540; padding:11px 16px; font-size:.83rem;
+    font-weight:600; color:#f1f5f9; border-bottom:1px solid #3b3b6b;
+    display:flex; justify-content:space-between; align-items:center;
+}}
+.lc-hdr-sub {{ color:#64748b; font-weight:400; font-size:.72rem; }}
+#lc-msgs {{
+    padding:10px 10px 6px; overflow-y:auto;
+    display:flex; flex-direction:column; gap:7px;
+    flex:1; min-height:60px; max-height:290px;
+}}
+.lcm {{
+    font-size:.8rem; line-height:1.45; padding:7px 11px;
+    border-radius:10px; max-width:88%; word-wrap:break-word; white-space:pre-wrap;
+}}
+.lcm-user {{ background:#1e3a5f; color:#93c5fd; align-self:flex-end; border-bottom-right-radius:3px; }}
+.lcm-bot  {{ background:#252540; color:#e2e8f0; align-self:flex-start; border-bottom-left-radius:3px; }}
+.lc-inp-row {{
+    display:flex; border-top:1px solid #252540;
+    padding:7px; gap:5px; background:#1a1a2e;
+}}
+#lc-inp {{
+    flex:1; background:#0f0f1e; border:1px solid #3b3b6b;
+    border-radius:8px; color:#f1f5f9; font-size:.8rem;
+    padding:6px 10px; outline:none; font-family:inherit;
+}}
+#lc-inp:focus {{ border-color:#3b82f6; }}
+#lc-send {{
+    background:#3b82f6; border:none; border-radius:8px;
+    color:white; font-size:.85rem; padding:6px 11px; cursor:pointer;
+}}
+#lc-send:hover {{ background:#2563eb; }}
+#lc-send:disabled {{ background:#1e3a5f; cursor:default; opacity:.6; }}
+</style>
+
+<div id="betiq-fab" onclick="lcToggle()" title="Quick Ask">💬</div>
+
+<div id="betiq-cp">
+  <div class="lc-hdr">
+    🏀 Quick Ask
+    <span class="lc-hdr-sub">reads your data only</span>
+  </div>
+  <div id="lc-msgs">{_msgs_html}</div>
+  <div class="lc-inp-row">
+    <input id="lc-inp" type="text" placeholder="Ask about your bets…"
+           onkeydown="if(event.key==='Enter')lcSend()">
+    <button id="lc-send" onclick="lcSend()">➤</button>
+  </div>
+</div>
+
+<script>
+(function() {{
+  function scrollMsgs() {{
+    var el = document.getElementById('lc-msgs');
+    if (el) el.scrollTop = el.scrollHeight;
+  }}
+  window.lcToggle = function() {{
+    var p = document.getElementById('betiq-cp');
+    var f = document.getElementById('betiq-fab');
+    var open = p.classList.toggle('open');
+    f.innerHTML = open ? '✕' : '💬';
+    localStorage.setItem('betiq_lc', open ? '1' : '0');
+    if (open) {{ setTimeout(function(){{ document.getElementById('lc-inp').focus(); scrollMsgs(); }}, 50); }}
+  }};
+  window.lcSend = function() {{
+    var inp = document.getElementById('lc-inp');
+    var btn = document.getElementById('lc-send');
+    var msg = inp.value.trim();
+    if (!msg) return;
+    inp.value = ''; btn.disabled = true; btn.innerHTML = '…';
+    localStorage.setItem('betiq_lc', '1');
+    var url = new URL(window.location.href);
+    url.searchParams.set('lm', msg);
+    window.location.href = url.toString();
+  }};
+  if (localStorage.getItem('betiq_lc') === '1') {{
+    var p = document.getElementById('betiq-cp');
+    var f = document.getElementById('betiq-fab');
+    if (p) {{ p.classList.add('open'); if(f) f.innerHTML = '✕'; scrollMsgs(); }}
+  }}
+  scrollMsgs();
+}})();
+</script>
+""", unsafe_allow_html=True)
