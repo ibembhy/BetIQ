@@ -74,8 +74,13 @@ def init_db():
         )
     """)
 
-    # Add CLV columns to existing databases that predate this feature
-    for col, definition in [("closing_odds", "INTEGER"), ("clv", "REAL")]:
+    # Add columns to existing databases that predate these features
+    for col, definition in [
+        ("closing_odds",    "INTEGER"),
+        ("clv",             "REAL"),
+        ("cancel_reason",   "TEXT"),
+        ("replaces_bet_id", "INTEGER"),
+    ]:
         try:
             c.execute(f"ALTER TABLE bets ADD COLUMN {col} {definition}")
         except Exception:
@@ -171,7 +176,7 @@ def get_all_bets() -> list:
     return rows
 
 
-def cancel_bet(bet_id: int) -> dict | None:
+def cancel_bet(bet_id: int, reason: str = "") -> dict | None:
     """Cancel an open bet and refund the stake. Returns the cancelled bet or None if not found."""
     conn = get_connection()
     row = conn.execute("SELECT * FROM bets WHERE id=? AND status='open'", (bet_id,)).fetchone()
@@ -180,12 +185,55 @@ def cancel_bet(bet_id: int) -> dict | None:
         return None
     bet = dict(row)
     conn.execute(
-        "UPDATE bets SET status='cancelled', resolved_at=? WHERE id=?",
-        (datetime.now(timezone.utc).isoformat(), bet_id),
+        "UPDATE bets SET status='cancelled', resolved_at=?, cancel_reason=? WHERE id=?",
+        (datetime.now(timezone.utc).isoformat(), reason, bet_id),
     )
     conn.commit()
     conn.close()
     return bet
+
+
+def link_replacement(new_bet_id: int, cancelled_bet_id: int):
+    """Mark a bet as the replacement for a previously cancelled bet."""
+    conn = get_connection()
+    conn.execute(
+        "UPDATE bets SET replaces_bet_id=? WHERE id=?",
+        (cancelled_bet_id, new_bet_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_replaced_bets() -> list:
+    """Return pairs of (cancelled bet, replacement bet) ordered by most recent."""
+    conn = get_connection()
+    rows = conn.execute(
+        """
+        SELECT
+            old.id            AS old_id,
+            old.matchup       AS old_matchup,
+            old.pick          AS old_pick,
+            old.bet_type      AS old_bet_type,
+            old.odds          AS old_odds,
+            old.edge          AS old_edge,
+            old.cancel_reason AS reason,
+            old.resolved_at   AS cancelled_at,
+            new.id            AS new_id,
+            new.matchup       AS new_matchup,
+            new.pick          AS new_pick,
+            new.bet_type      AS new_bet_type,
+            new.odds          AS new_odds,
+            new.edge          AS new_edge,
+            new.status        AS new_status,
+            new.pnl           AS new_pnl,
+            new.placed_at     AS replaced_at
+        FROM bets old
+        JOIN bets new ON new.replaces_bet_id = old.id
+        ORDER BY new.placed_at DESC
+        """
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
 
 
 def update_bet_clv(bet_id: int, closing_odds: int, clv: float):

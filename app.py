@@ -579,7 +579,7 @@ stats = bet_stats(resolved)
 
 # ── Main tabs ─────────────────────────────────────────────────────────────────
 
-tab_today, tab_chat, tab_history, tab_perf, tab_reports, tab_runners = st.tabs(["🏀 Today", "💬 Chat", "📋 Bet History", "📈 Performance", "📄 Daily Reports", "👀 Runner-Up Bets"])
+tab_today, tab_chat, tab_history, tab_perf, tab_reports, tab_runners, tab_replaced = st.tabs(["🏀 Today", "💬 Chat", "📋 Bet History", "📈 Performance", "📄 Daily Reports", "👀 Runner-Up Bets", "🔄 Replaced Bets"])
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1138,4 +1138,78 @@ with tab_runners:
                     <span class="bet-badge" style="background:#422006;color:#fb923c;">⏭ {skip_label}</span>
                 </div>
                 {f'<div class="bet-meta" style="margin-top:8px;">{c["reasoning"]}</div>' if c.get("reasoning") else ""}
+            </div>""", unsafe_allow_html=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TAB 6 — Replaced Bets
+# ═══════════════════════════════════════════════════════════════════════════════
+
+with tab_replaced:
+    st.markdown("### Replaced Bets")
+    st.caption("Bets the agent cancelled and swapped out for a stronger pick.")
+
+    pairs = db.get_replaced_bets()
+
+    if not pairs:
+        st.info("No replaced bets yet. They appear here when the agent cancels a bet and places a stronger one in its place.")
+    else:
+        st.markdown(f"**{len(pairs)} swap(s) recorded**")
+        st.divider()
+
+        for p in pairs:
+            old_odds_fmt = fo(p["old_odds"]) if p["old_odds"] else "—"
+            new_odds_fmt = fo(p["new_odds"]) if p["new_odds"] else "—"
+
+            edge_delta = round(p["new_edge"] - p["old_edge"], 1)
+            delta_color = "#22c55e" if edge_delta > 0 else "#ef4444"
+
+            new_status = p.get("new_status", "open")
+            if new_status == "won":
+                result_badge = '<span class="bet-badge badge-high">✓ Won</span>'
+            elif new_status == "lost":
+                result_badge = '<span class="bet-badge badge-low">✗ Lost</span>'
+            elif new_status == "open":
+                result_badge = '<span class="bet-badge badge-med">Open</span>'
+            else:
+                result_badge = f'<span class="bet-badge">{new_status.title()}</span>'
+
+            cancelled_ts = p["cancelled_at"][:10] if p.get("cancelled_at") else "—"
+
+            st.markdown(f"""
+            <div class="bet-card open" style="border-left-color:#6366f1; padding:14px 16px;">
+
+                <div style="font-size:0.72rem;color:#64748b;margin-bottom:8px;">
+                    Swap on {cancelled_ts}
+                </div>
+
+                <!-- CANCELLED BET -->
+                <div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;">
+                    <span style="font-size:1.1rem;">❌</span>
+                    <div>
+                        <div class="bet-pick" style="font-size:0.95rem;color:#94a3b8;">#{p['old_id']} &nbsp;{p['old_pick']}</div>
+                        <div class="bet-meta">{p['old_matchup']} &nbsp;·&nbsp; {p['old_bet_type'].title()} @ {old_odds_fmt} &nbsp;·&nbsp; {p['old_edge']:.1f}% edge</div>
+                    </div>
+                </div>
+
+                <!-- REASON -->
+                <div style="margin:6px 0 6px 30px;font-size:0.8rem;color:#f59e0b;font-style:italic;">
+                    ↳ {p['reason'] if p.get('reason') else 'Replaced by stronger pick'}
+                </div>
+
+                <!-- NEW BET -->
+                <div style="display:flex;align-items:center;justify-content:space-between;margin-top:4px;">
+                    <div style="display:flex;align-items:center;gap:10px;">
+                        <span style="font-size:1.1rem;">✅</span>
+                        <div>
+                            <div class="bet-pick" style="font-size:0.95rem;">#{p['new_id']} &nbsp;{p['new_pick']}</div>
+                            <div class="bet-meta">{p['new_matchup']} &nbsp;·&nbsp; {p['new_bet_type'].title()} @ {new_odds_fmt} &nbsp;·&nbsp; {p['new_edge']:.1f}% edge</div>
+                        </div>
+                    </div>
+                    <div style="text-align:right;">
+                        <div style="font-size:0.85rem;font-weight:600;color:{delta_color};">edge {'+' if edge_delta >= 0 else ''}{edge_delta}%</div>
+                        {result_badge}
+                    </div>
+                </div>
+
             </div>""", unsafe_allow_html=True)

@@ -869,6 +869,7 @@ def place_paper_bet(
     edge: float,
     reasoning: str,
     game_date: str = None,
+    replaces_bet_id: int = None,
 ) -> dict:
     balance    = db.get_balance()
     open_bets  = db.get_open_bets()
@@ -907,6 +908,9 @@ def place_paper_bet(
     bet_id = db.insert_bet(bet)
     db.update_balance(balance - stake)
 
+    if replaces_bet_id:
+        db.link_replacement(bet_id, replaces_bet_id)
+
     _send_notification(
         title=f"BetIQ Bet Placed",
         message=f"{pick} ({bet_type})\n{matchup}\nOdds: {odds:+d} | Edge: {edge:.1f}% | Confidence: {confidence}\nKelly: {kelly_pct:.1f}% | Stake: ${stake:.2f} | Balance: ${round(balance - stake, 2):.2f}",
@@ -933,7 +937,7 @@ def cancel_bet(bet_id: int, reason: str = "") -> dict:
     Cancel an open bet and refund the stake to the bankroll.
     Use this to swap a weaker bet for a stronger one found later.
     """
-    bet = db.cancel_bet(bet_id)
+    bet = db.cancel_bet(bet_id, reason)
     if not bet:
         return {"error": f"Bet #{bet_id} not found or already resolved."}
 

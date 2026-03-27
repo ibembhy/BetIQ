@@ -88,8 +88,8 @@ After every scan — whether you placed bets or not — call `save_note` to reco
 
 ## Bet swapping rules
 If all 5 bet slots are full but you find a new bet with an edge at least 3% higher than an existing open bet:
-1. Call `cancel_bet` on the weakest open bet (lowest edge), stating why it's being replaced
-2. Immediately place the new stronger bet with `place_paper_bet`
+1. Call `cancel_bet` on the weakest open bet (lowest edge), stating why it's being replaced — note the returned `cancelled_bet_id`
+2. Immediately place the new stronger bet with `place_paper_bet`, passing `replaces_bet_id` = the cancelled bet's ID
 Never cancel a bet just to free up a slot — only swap when the new edge is meaningfully better.
 
 ## Output format for every structured pick:
@@ -292,8 +292,9 @@ TOOLS = [
                 "odds":      {"type": "integer", "description": "American odds for this pick"},
                 "confidence":{"type": "string", "enum": ["High", "Medium"]},
                 "edge":      {"type": "number", "description": "Your calculated edge % (must be >= 5)"},
-                "reasoning": {"type": "string", "description": "Why this bet has edge"},
-                "game_date": {"type": "string", "description": "YYYY-MM-DD format"},
+                "reasoning":       {"type": "string",  "description": "Why this bet has edge"},
+                "game_date":       {"type": "string",  "description": "YYYY-MM-DD format"},
+                "replaces_bet_id": {"type": "integer", "description": "ID of the cancelled bet this replaces (only set when swapping)"},
             },
             "required": ["matchup", "pick", "bet_type", "odds", "confidence", "edge", "reasoning"],
         },
