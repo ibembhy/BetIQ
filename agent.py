@@ -664,3 +664,203 @@ def run_lite_agent(user_message: str, conversation_history: list) -> tuple[str, 
             messages.append({"role": "user", "content": results})
 
     return "Couldn't complete that request.", messages, []
+
+
+# ── Pre-fetch agent (Sonnet, write-tools only, data passed in context) ─────────
+
+PREFETCH_SYSTEM = """You are BetIQ, an elite NBA sports betting analyst and autonomous paper trader.
+
+All game data has been pre-fetched and is provided in the user message. Do NOT call any data tools — everything you need is already there.
+
+## Your task
+1. Analyze the provided data: stats, form, splits, rest, injuries, H2H, odds, public %, line movement, book discrepancies
+2. Estimate your win probability for the most promising bet type (ML, spread, or total)
+3. Calculate edge = your_prob − implied_prob
+4. If edge ≥ 5%: call `get_bankroll`, then `place_paper_bet`
+5. If edge < 5% or confidence too low: call `log_candidate_bet`
+6. Call `save_note` to record any pattern or lesson
+
+## Implied probability from American odds
+- Positive odds (+X): implied = 100 / (X + 100)
+- Negative odds (−X): implied = X / (X + 100)
+
+## Reading public % and line movement
+- Money % significantly higher than ticket % → sharp money on that side
+- 70%+ public tickets + line moving the other way → sharp fade signal
+- Line moved 1+ point toward your pick since open → sharp confirmation; moved against → red flag
+
+## Reading book discrepancies
+- ML spread ≥ 15 pts across books → stale line, strong confirming signal if it aligns with your pick
+- ML spread 8–14 pts → moderate signal
+- Total spread ≥ 2.5 pts → may signal injury news or sharp total action
+
+## Bankroll & stake rules
+- Half-Kelly sizing: f = (p·b − q) / b, halved, capped at 12% of bankroll
+- Pass `edge` and `odds` to `place_paper_bet` — stake is computed automatically
+- Never bet below 5% edge. Never exceed 5 open bets.
+- Always call `get_bankroll` immediately before `place_paper_bet`
+
+## Bet swapping
+If all 5 slots are full but new edge is 3%+ higher than the weakest open bet:
+1. Call `cancel_bet` on the weakest bet — note the returned `cancelled_bet_id`
+2. Call `place_paper_bet` with `replaces_bet_id` set
+
+## Output format
+```
+MATCHUP: [Team A vs Team B]
+MY EDGE: [Your prob X% vs implied Y% = Z% edge]
+PICK: [e.g. "Boston Celtics ML"]
+CONFIDENCE: [High / Medium / Low]
+STAKE: [$X of $Y bankroll]
+REASONING: [2-3 sentences on decisive data points]
+PAST PERFORMANCE NOTE: [Relevant pattern from bet history, or "No history yet"]
+```
+"""
+
+PREFETCH_TOOLS = [
+    {
+        "name": "get_bankroll",
+        "description": "Current balance, open bets, and available slots. Call immediately before place_paper_bet.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "place_paper_bet",
+        "description": "Log a paper bet. MUST call get_bankroll first.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "matchup":         {"type": "string"},
+                "pick":            {"type": "string"},
+                "bet_type":        {"type": "string", "enum": ["moneyline", "spread", "total"]},
+                "odds":            {"type": "integer"},
+                "confidence":      {"type": "string", "enum": ["High", "Medium"]},
+                "edge":            {"type": "number"},
+                "reasoning":       {"type": "string"},
+                "game_date":       {"type": "string"},
+                "replaces_bet_id": {"type": "integer"},
+            },
+            "required": ["matchup", "pick", "bet_type", "odds", "confidence", "edge", "reasoning"],
+        },
+    },
+    {
+        "name": "cancel_bet",
+        "description": "Cancel an open bet to replace it with a stronger one (new edge must be 3%+ higher).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "bet_id": {"type": "integer"},
+                "reason": {"type": "string"},
+            },
+            "required": ["bet_id", "reason"],
+        },
+    },
+    {
+        "name": "log_candidate_bet",
+        "description": "Log a near-miss bet that was analysed but not placed.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "matchup":     {"type": "string"},
+                "pick":        {"type": "string"},
+                "bet_type":    {"type": "string", "enum": ["moneyline", "spread", "total"]},
+                "odds":        {"type": "integer"},
+                "edge_pct":    {"type": "number"},
+                "confidence":  {"type": "string", "enum": ["High", "Medium", "Low"]},
+                "skip_reason": {
+                    "type": "string",
+                    "enum": ["edge_below_threshold", "slots_full", "sharp_money_opposing",
+                             "injury_uncertainty", "line_moved_against", "low_confidence", "other"],
+                },
+                "reasoning":   {"type": "string"},
+            },
+            "required": ["matchup", "pick", "bet_type", "odds", "edge_pct", "confidence", "skip_reason"],
+        },
+    },
+    {
+        "name": "save_note",
+        "description": "Save a lesson, pattern, or hypothesis to persistent memory.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "note_type": {
+                    "type": "string",
+                    "enum": ["lesson", "pattern", "hypothesis", "model_update"],
+                },
+                "content": {"type": "string"},
+            },
+            "required": ["note_type", "content"],
+        },
+        "cache_control": {"type": "ephemeral"},
+    },
+]
+
+_PREFETCH_DISPATCH = {
+    "get_bankroll":       lambda a: t.get_bankroll(),
+    "place_paper_bet":    lambda a: t.place_paper_bet(**a),
+    "cancel_bet":         lambda a: t.cancel_bet(**a),
+    "log_candidate_bet":  lambda a: t.log_candidate_bet(**a),
+    "save_note":          lambda a: t.save_note(**a),
+}
+
+
+def run_agent_prefetch(context: str, conversation_history: list) -> tuple[str, list, list]:
+    """
+    Agent run with pre-fetched data supplied in the context string.
+    Only write tools are available — no data-fetching API calls.
+    """
+    messages = conversation_history + [{"role": "user", "content": context}]
+    all_thinking: list[str] = []
+
+    while True:
+        response = None
+        for attempt in range(6):
+            try:
+                response = client.messages.create(
+                    model="claude-sonnet-4-6",
+                    max_tokens=3000,
+                    thinking={"type": "enabled", "budget_tokens": 2000},
+                    system=[{"type": "text", "text": PREFETCH_SYSTEM, "cache_control": {"type": "ephemeral"}}],
+                    tools=PREFETCH_TOOLS,
+                    messages=messages,
+                )
+                break
+            except RateLimitError:
+                wait = 60 * (attempt + 1)
+                print(f"Rate limit — waiting {wait}s (attempt {attempt + 1}/6)...", flush=True)
+                time.sleep(wait)
+
+        if response is None:
+            raise RuntimeError("API rate limit exceeded after all retries.")
+
+        for block in response.content:
+            if block.type == "thinking":
+                all_thinking.append(block.thinking)
+
+        history_content = [b for b in response.content if b.type != "thinking"]
+        messages.append({"role": "assistant", "content": history_content})
+
+        if response.stop_reason == "end_turn":
+            text_parts = [b.text for b in response.content if getattr(b, "type", None) == "text"]
+            return "\n".join(text_parts).strip() or "Analysis complete.", messages, all_thinking
+
+        if response.stop_reason == "tool_use":
+            tool_results = []
+            for block in response.content:
+                if block.type == "tool_use":
+                    fn = _PREFETCH_DISPATCH.get(block.name)
+                    try:
+                        result = fn(block.input) if fn else {"error": f"Unknown tool: {block.name}"}
+                        result_str = json.dumps(result, default=str)
+                    except Exception as exc:
+                        result_str = json.dumps({"error": str(exc)})
+                    tool_results.append({
+                        "type":        "tool_result",
+                        "tool_use_id": block.id,
+                        "content":     result_str,
+                    })
+            messages.append({"role": "user", "content": tool_results})
+            continue
+
+        break
+
+    return "Agent loop ended unexpectedly.", messages, all_thinking
