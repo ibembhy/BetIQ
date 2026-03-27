@@ -14,6 +14,7 @@ Run with:
 """
 
 import logging
+import os
 import sys
 from datetime import datetime, timedelta
 
@@ -189,6 +190,16 @@ def late_scan():
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    # Prevent duplicate instances
+    LOCK_FILE = os.path.join(os.path.dirname(__file__), "runner.lock")
+    if os.path.exists(LOCK_FILE):
+        with open(LOCK_FILE) as f:
+            pid = f.read().strip()
+        print(f"Runner already running (PID {pid}). Exiting.")
+        sys.exit(1)
+    with open(LOCK_FILE, "w") as f:
+        f.write(str(os.getpid()))
+
     scheduler = BlockingScheduler(timezone=EST)
 
     # 2:00 PM EST — lines posted
@@ -214,3 +225,6 @@ if __name__ == "__main__":
             title="BetIQ Runner Stopped",
             message="The autonomous scanner has been stopped.",
         )
+    finally:
+        if os.path.exists(LOCK_FILE):
+            os.remove(LOCK_FILE)
