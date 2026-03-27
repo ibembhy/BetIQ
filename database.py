@@ -76,10 +76,12 @@ def init_db():
 
     # Add columns to existing databases that predate these features
     for col, definition in [
-        ("closing_odds",    "INTEGER"),
-        ("clv",             "REAL"),
-        ("cancel_reason",   "TEXT"),
-        ("replaces_bet_id", "INTEGER"),
+        ("closing_odds",      "INTEGER"),
+        ("clv",               "REAL"),
+        ("cancel_reason",     "TEXT"),
+        ("replaces_bet_id",   "INTEGER"),
+        ("betfair_bet_id",    "TEXT"),
+        ("betfair_market_id", "TEXT"),
     ]:
         try:
             c.execute(f"ALTER TABLE bets ADD COLUMN {col} {definition}")
@@ -161,6 +163,16 @@ def insert_bet(bet: dict) -> int:
     conn.commit()
     conn.close()
     return bet_id
+
+
+def set_betfair_ids(bet_id: int, betfair_bet_id: str, betfair_market_id: str):
+    conn = get_connection()
+    conn.execute(
+        "UPDATE bets SET betfair_bet_id=?, betfair_market_id=? WHERE id=?",
+        (betfair_bet_id, betfair_market_id, bet_id),
+    )
+    conn.commit()
+    conn.close()
 
 
 def get_open_bets() -> list:

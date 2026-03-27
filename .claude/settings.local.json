@@ -1,0 +1,35 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(venv/Scripts/python.exe -c \":*)",
+      "Bash(venv/Scripts/pip install:*)",
+      "Bash(venv/Scripts/python.exe -c \"from runner import *; print\\(''runner.py imports OK''\\)\")",
+      "Bash(schtasks /create /tn \"BetIQ Runner\" /tr \"C:\\\\Users\\\\cbemb\\\\Documents\\\\BetIQ\\\\start_runner.bat\" /sc onlogon /ru \"cbemb\" /f)",
+      "Bash(cmd.exe /c \"schtasks /create /tn \"\"BetIQ Runner\"\" /tr \"\"C:\\\\Users\\\\cbemb\\\\Documents\\\\BetIQ\\\\start_runner.bat\"\" /sc onlogon /ru cbemb /f\")",
+      "Bash(powershell.exe -Command \"schtasks /create /tn ''BetIQ Runner'' /tr ''C:\\\\Users\\\\cbemb\\\\Documents\\\\BetIQ\\\\start_runner.bat'' /sc onlogon /ru cbemb /f\")",
+      "Bash(.venv/Scripts/pip.exe install:*)",
+      "Bash(ls -la /c/Users/cbemb/Documents/BetIQ/*.py /c/Users/cbemb/Documents/BetIQ/*.txt /c/Users/cbemb/Documents/BetIQ/*.bat)",
+      "Bash(git --version)",
+      "Bash(gh --version)",
+      "Bash(git init:*)",
+      "Bash(git add:*)",
+      "Bash(git config:*)",
+      "Bash(git commit:*)",
+      "Bash(python -c \":*)",
+      "Bash(venv/Scripts/python -c \":*)",
+      "Bash(venv/Scripts/python backtest.py)",
+      "Bash(ls c:/Users/cbemb/Documents/BetIQ/*.py)",
+      "Bash(python -c \"import database; database.init_db\\(\\); print\\(''DB OK''\\)\")",
+      "Bash(python3 -c \"import database; database.init_db\\(\\); print\\(''DB OK''\\)\")",
+      "Bash(source venv/Scripts/activate)",
+      "Bash(python -c \"import database; database.init_db\\(\\); import tools; print\\(''OK''\\)\")",
+      "Bash(python -c \"import tools; print\\(''OK''\\)\")",
+      "Bash(grep -n '\"\"get_current_odds\"\"\\\\|\"\"get_line_movement\"\"\\\\|\"\"get_public_betting\"\"' agent.py)",
+      "Bash(python -c \"import tools; import agent; print\\(''OK''\\)\")",
+      "Bash(tasklist /FI \"IMAGENAME eq python.exe\")",
+      "Bash(kill 462 440)",
+      "Bash(venv/Scripts/python runner.py)",
+      "Bash(venv/Scripts/pip.exe install:*)"
+    ]
+  }
+}

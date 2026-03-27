@@ -390,11 +390,20 @@ def bet_stats(bets: list) -> dict:
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 
 with st.sidebar:
-    st.markdown("""
+    import betfair as _bf
+    _live = _bf.is_live()
+    _mode_color = "#22c55e" if _live else "#64748b"
+    _mode_label = "LIVE" if _live else "PAPER"
+    st.markdown(f"""
     <div class="betiq-header">
         <div class="betiq-logo">🏀</div>
         <div>
-            <div class="betiq-title">BetIQ</div>
+            <div class="betiq-title">BetIQ
+                <span style="font-size:0.6rem;font-weight:700;background:{_mode_color};color:#fff;
+                             padding:2px 7px;border-radius:10px;margin-left:8px;vertical-align:middle;">
+                    {_mode_label}
+                </span>
+            </div>
             <div class="betiq-subtitle">NBA Autonomous Betting Analyst</div>
         </div>
     </div>
@@ -455,6 +464,7 @@ with st.sidebar:
         st.caption("No open bets — scanner will place bets at next scan.")
     else:
         for bet in open_bets:
+            reasoning_html = f'<div class="bet-meta" style="margin-top:6px;font-style:italic;">{bet["reasoning"]}</div>' if bet.get("reasoning") else ""
             st.markdown(f"""
             <div class="bet-card open">
                 <div class="bet-pick">{bet['pick']}</div>
@@ -465,6 +475,7 @@ with st.sidebar:
                     <span class="bet-badge badge-open">{fo(bet['odds'])}</span>
                 </div>
                 <div class="bet-meta" style="margin-top:4px;">Stake: ${bet['stake']:.2f}</div>
+                {reasoning_html}
             </div>""", unsafe_allow_html=True)
 
     if st.button("Check Results", use_container_width=True):
@@ -520,9 +531,8 @@ with st.sidebar:
 </div>
 <script>
   const SCANS = [
-    { hour: 14, minute: 0,  label: "Afternoon (2:00 PM)" },
-    { hour: 18, minute: 0,  label: "Evening (6:00 PM)"   },
-    { hour: 21, minute: 30, label: "Late (9:30 PM)"      },
+    { hour: 14, minute: 0, label: "Afternoon (2:00 PM)" },
+    { hour: 18, minute: 0, label: "Evening (6:00 PM)"   },
   ];
 
   function nextScan() {
@@ -539,7 +549,7 @@ with st.sidebar:
         return { label: scan.label, diffSec: scanSec - nowSec };
       }
     }
-    // Past 9:30 PM — next is tomorrow's 2 PM
+    // Past 6:00 PM — next is tomorrow's 2 PM
     return { label: "Afternoon (2:00 PM)", diffSec: (14 * 3600) + (86400 - nowSec) };
   }
 
@@ -946,6 +956,7 @@ with tab_history:
         # ── Bet cards ──
         for b in filtered:
             pnl_str = f"${b['pnl']:+.2f}" if b["status"] not in ("open", "cancelled") else "—"
+            reasoning_html = f'<div class="bet-meta" style="margin-top:8px;font-style:italic;">{b["reasoning"]}</div>' if b.get("reasoning") else ""
             st.markdown(f"""
             <div class="bet-card {b['status']}">
                 <div style="display:flex; justify-content:space-between; align-items:flex-start;">
@@ -964,6 +975,7 @@ with tab_history:
                     {edge_badge(b['edge'])}
                     <span class="bet-badge badge-open">Stake ${b['stake']:.2f}</span>
                 </div>
+                {reasoning_html}
             </div>""", unsafe_allow_html=True)
 
 

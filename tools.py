@@ -1048,24 +1048,50 @@ def place_paper_bet(
     if replaces_bet_id:
         db.link_replacement(bet_id, replaces_bet_id)
 
+    # ── Betfair live bet (only when BETFAIR_LIVE_MODE=true) ───────────────────
+    betfair_result = {}
+    if bet_type == "moneyline":
+        try:
+            import betfair as bf
+            if bf.is_live():
+                betfair_result = bf.place_live_bet(
+                    matchup=matchup,
+                    pick=pick,
+                    american_odds=odds,
+                    stake=stake,
+                )
+                if "bet_id" in betfair_result:
+                    db.set_betfair_ids(bet_id, betfair_result["bet_id"], betfair_result["market_id"])
+        except Exception as exc:
+            betfair_result = {"error": str(exc)}
+
+    bf_msg = ""
+    if betfair_result.get("bet_id"):
+        bf_msg = f"\nBetfair: ✅ Bet placed (ID {betfair_result['bet_id']})"
+    elif betfair_result.get("error"):
+        bf_msg = f"\nBetfair: ⚠️ {betfair_result['error']}"
+    elif betfair_result.get("skipped"):
+        bf_msg = "\nBetfair: Paper mode only"
+
     _send_notification(
         title=f"BetIQ Bet Placed",
-        message=f"{pick} ({bet_type})\n{matchup}\nOdds: {odds:+d} | Edge: {edge:.1f}% | Confidence: {confidence}\nKelly: {kelly_pct:.1f}% | Stake: ${stake:.2f} | Balance: ${round(balance - stake, 2):.2f}",
+        message=f"{pick} ({bet_type})\n{matchup}\nOdds: {odds:+d} | Edge: {edge:.1f}% | Confidence: {confidence}\nKelly: {kelly_pct:.1f}% | Stake: ${stake:.2f} | Balance: ${round(balance - stake, 2):.2f}{bf_msg}",
     )
 
     return {
-        "success":          True,
-        "bet_id":           bet_id,
-        "matchup":          matchup,
-        "pick":             pick,
-        "odds":             odds,
-        "stake":            stake,
+        "success":            True,
+        "bet_id":             bet_id,
+        "matchup":            matchup,
+        "pick":               pick,
+        "odds":               odds,
+        "stake":              stake,
         "kelly_fraction_pct": kelly_pct,
-        "potential_payout": potential_payout,
-        "confidence":       confidence,
-        "edge_pct":         edge,
-        "new_balance":      round(balance - stake, 2),
-        "message":          f"Bet #{bet_id} placed: ${stake:.2f} ({kelly_pct:.1f}% Kelly) on {pick} at {odds:+d}",
+        "potential_payout":   potential_payout,
+        "confidence":         confidence,
+        "edge_pct":           edge,
+        "new_balance":        round(balance - stake, 2),
+        "betfair":            betfair_result,
+        "message":            f"Bet #{bet_id} placed: ${stake:.2f} ({kelly_pct:.1f}% Kelly) on {pick} at {odds:+d}{bf_msg}",
     }
 
 
