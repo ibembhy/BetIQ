@@ -35,6 +35,7 @@ SYSTEM_PROMPT = """You are BetIQ, an elite NBA sports betting analyst and autono
 - `get_injury_report` for both teams
 - `get_head_to_head` between the two teams
 - `get_current_odds` for the game
+- `get_book_discrepancies` for both teams — detect cross-book line disagreements that signal sharp action or stale pricing
 - `get_public_betting_percentages` for the game — check where public and sharp money are going
 - `get_line_movement` for both teams — detect whether the line has moved toward or away from your pick
 - `calculate_implied_probability` on the odds of your intended pick
@@ -44,6 +45,14 @@ SYSTEM_PROMPT = """You are BetIQ, an elite NBA sports betting analyst and autono
 - 70%+ public tickets on one team + line moving the other way → classic sharp fade → consider the other side
 - Line moved 1+ point toward your pick since opening → sharp confirmation; moved against → red flag, reassess
 - Never use public % alone — treat it as a confirming or disconfirming signal on top of your statistical edge
+
+**Reading book discrepancies (`get_book_discrepancies`):**
+- ML spread ≥ 15 pts across books → large discrepancy; one book likely has stale pricing — always bet the best available price and flag this as a confirming signal
+- ML spread 8–14 pts → moderate; worth noting but not conclusive on its own
+- ML spread < 8 pts → books aligned; no additional signal
+- Total line spread ≥ 2.5 pts → unusual; may signal injury news or sharp total action not yet priced everywhere
+- A large discrepancy that aligns with your model edge (e.g. your model likes Team A and Team A has the best line at one stale book) is a strong double-confirmation — increase confidence tier
+- A large discrepancy that contradicts your pick (your model likes Team A but sharp books have moved heavily against them) → red flag, reduce edge estimate or skip
 
 **Edge calculation:**
 - Estimate your own win probability using all gathered data
@@ -255,6 +264,21 @@ TOOLS = [
         },
     },
     {
+        "name": "get_book_discrepancies",
+        "description": (
+            "Scan all bookmakers for a team's game and flag significant ML, spread, or total line disagreements. "
+            "A spread ≥ 15 pts on the ML signals a stale line or unpriced news — strong confirming signal when it aligns with your model edge. "
+            "Call this for every game you are seriously considering betting."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "team_name": {"type": "string", "description": "Either team in the matchup"},
+            },
+            "required": ["team_name"],
+        },
+    },
+    {
         "name": "get_historical_odds",
         "description": "Past game results and closing lines for recent games (up to 3 days back). Use for model calibration.",
         "input_schema": {
@@ -439,6 +463,7 @@ DISPATCH = {
     "get_public_betting_percentages": lambda a: t.get_public_betting_percentages(**a),
     "get_line_movement":         lambda a: t.get_line_movement(**a),
     "get_current_odds":          lambda a: t.get_current_odds(**a),
+    "get_book_discrepancies":    lambda a: t.get_book_discrepancies(**a),
     "get_historical_odds":       lambda a: t.get_historical_odds(**a),
     "calculate_implied_probability": lambda a: t.calculate_implied_probability(**a),
     "cancel_bet":                lambda a: t.cancel_bet(**a),

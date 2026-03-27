@@ -661,6 +661,130 @@ def get_current_odds(team_name: str = None) -> dict:
     return {"games": games, "count": len(games)}
 
 
+def get_book_discrepancies(team_name: str) -> dict:
+    """
+    Scan all bookmakers for a team's game and flag significant line discrepancies.
+    A large spread between books signals a stale line, sharp action, or unpriced news.
+    Returns the best available line per market, which book offers it, and the spread vs worst book.
+    """
+    data = _odds_get("/sports/basketball_nba/odds/", {
+        "regions":    "us",
+        "markets":    "h2h,spreads,totals",
+        "oddsFormat": "american",
+        "dateFormat": "iso",
+    })
+    if isinstance(data, dict) and "error" in data:
+        return data
+
+    event = None
+    for e in (data if isinstance(data, list) else []):
+        tl = team_name.lower()
+        if tl in e.get("home_team", "").lower() or tl in e.get("away_team", "").lower():
+            event = e
+            break
+
+    if not event:
+        return {"error": f"No game found today for {team_name}."}
+
+    home = event["home_team"]
+    away = event["away_team"]
+
+    # Collect per-book ML prices
+    ml_prices: dict = {home: {}, away: {}}
+    spread_prices: dict = {home: {}, away: {}}
+    total_over: dict = {}
+
+    for bm in event.get("bookmakers", []):
+        bm_name = bm.get("title", bm.get("key", "Unknown"))
+        for market in bm.get("markets", []):
+            key = market["key"]
+            for outcome in market.get("outcomes", []):
+                name  = outcome["name"]
+                price = outcome.get("price")
+                point = outcome.get("point")
+                if key == "h2h" and name in ml_prices:
+                    ml_prices[name][bm_name] = price
+                elif key == "spreads" and name in spread_prices and point is not None:
+                    spread_prices[name][bm_name] = {"point": point, "price": price}
+                elif key == "totals" and name == "Over" and point is not None:
+                    total_over[bm_name] = {"point": point, "price": price}
+
+    def _ml_analysis(team: str) -> dict:
+        prices = {k: v for k, v in ml_prices[team].items() if v is not None}
+        if len(prices) < 2:
+            return {}
+        best_book  = max(prices, key=lambda b: prices[b])
+        worst_book = min(prices, key=lambda b: prices[b])
+        best_price  = prices[best_book]
+        worst_price = prices[worst_book]
+        spread = best_price - worst_price
+        return {
+            "best_price":  best_price,
+            "best_book":   best_book,
+            "worst_price": worst_price,
+            "worst_book":  worst_book,
+            "spread_pts":  spread,
+            "all_books":   prices,
+            "signal": (
+                "LARGE DISCREPANCY — possible stale line or unpriced news" if spread >= 15
+                else "Moderate discrepancy — worth noting" if spread >= 8
+                else "Books in agreement"
+            ),
+        }
+
+    def _total_analysis() -> dict:
+        if len(total_over) < 2:
+            return {}
+        points = {k: v["point"] for k, v in total_over.items() if v.get("point") is not None}
+        if not points:
+            return {}
+        high_book = max(points, key=lambda b: points[b])
+        low_book  = min(points, key=lambda b: points[b])
+        spread = points[high_book] - points[low_book]
+        return {
+            "highest_total": {"book": high_book, "line": points[high_book]},
+            "lowest_total":  {"book": low_book,  "line": points[low_book]},
+            "spread_pts":    spread,
+            "all_books":     points,
+            "signal": (
+                "LARGE DISCREPANCY — total line unsettled" if spread >= 2.5
+                else "Moderate discrepancy" if spread >= 1.0
+                else "Books in agreement"
+            ),
+        }
+
+    home_ml = _ml_analysis(home)
+    away_ml = _ml_analysis(away)
+    total   = _total_analysis()
+
+    # Surface top-level signals for easy agent parsing
+    signals = []
+    for team, analysis in [(home, home_ml), (away, away_ml)]:
+        if analysis.get("spread_pts", 0) >= 8:
+            signals.append(
+                f"{team} ML: {analysis['spread_pts']:+d} pt spread — "
+                f"best {analysis['best_price']:+d} at {analysis['best_book']}, "
+                f"worst {analysis['worst_price']:+d} at {analysis['worst_book']}. "
+                f"{analysis['signal']}."
+            )
+    if total.get("spread_pts", 0) >= 1.0:
+        signals.append(
+            f"Total line: {total['spread_pts']:.1f} pt spread — "
+            f"high {total['highest_total']['line']} at {total['highest_total']['book']}, "
+            f"low {total['lowest_total']['line']} at {total['lowest_total']['book']}. "
+            f"{total['signal']}."
+        )
+
+    return {
+        "matchup":    f"{away} @ {home}",
+        "books_seen": len(event.get("bookmakers", [])),
+        "signals":    signals if signals else ["No significant discrepancies — books are aligned."],
+        "home_ml":    home_ml,
+        "away_ml":    away_ml,
+        "totals":     total,
+    }
+
+
 def _save_odds_snapshot(home: str, away: str, best_lines: dict):
     """Persist current odds to DB for line movement tracking. Called inside get_current_odds."""
     import json
