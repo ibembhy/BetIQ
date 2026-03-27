@@ -478,6 +478,86 @@ with st.sidebar:
         else:
             st.caption("No completed games found yet.")
 
+    # ── Next scan countdown ──
+    st.markdown('<div class="section-header">Next Scan</div>', unsafe_allow_html=True)
+    import streamlit.components.v1 as _components
+    _components.html("""
+<style>
+  #countdown-wrap {
+    background: #1a1a2e;
+    border: 1px solid #252540;
+    border-radius: 10px;
+    padding: 10px 14px;
+    text-align: center;
+    font-family: 'Inter', sans-serif;
+  }
+  #scan-label {
+    font-size: 0.68rem;
+    color: #64748b;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    margin-bottom: 4px;
+  }
+  #scan-name {
+    font-size: 0.75rem;
+    color: #94a3b8;
+    margin-bottom: 6px;
+  }
+  #countdown {
+    font-size: 1.5rem;
+    font-weight: 700;
+    color: #f1f5f9;
+    letter-spacing: 2px;
+    font-variant-numeric: tabular-nums;
+  }
+  #dot { color: #22c55e; font-size: 0.55rem; vertical-align: middle; margin-right: 4px; }
+</style>
+<div id="countdown-wrap">
+  <div id="scan-label"><span id="dot">&#9679;</span> Scanner running</div>
+  <div id="scan-name"></div>
+  <div id="countdown">--:--:--</div>
+</div>
+<script>
+  const SCANS = [
+    { hour: 14, minute: 0,  label: "Afternoon (2:00 PM)" },
+    { hour: 18, minute: 0,  label: "Evening (6:00 PM)"   },
+    { hour: 21, minute: 30, label: "Late (9:30 PM)"      },
+  ];
+
+  function nextScan() {
+    const now = new Date();
+    // Get current time in EST
+    const estStr = now.toLocaleString("en-US", { timeZone: "America/New_York" });
+    const est    = new Date(estStr);
+    const h = est.getHours(), m = est.getMinutes(), s = est.getSeconds();
+    const nowSec = h * 3600 + m * 60 + s;
+
+    for (const scan of SCANS) {
+      const scanSec = scan.hour * 3600 + scan.minute * 60;
+      if (scanSec > nowSec) {
+        return { label: scan.label, diffSec: scanSec - nowSec };
+      }
+    }
+    // Past 9:30 PM — next is tomorrow's 2 PM
+    return { label: "Afternoon (2:00 PM)", diffSec: (14 * 3600) + (86400 - nowSec) };
+  }
+
+  function pad(n) { return String(n).padStart(2, "0"); }
+
+  function tick() {
+    const { label, diffSec } = nextScan();
+    const h = Math.floor(diffSec / 3600);
+    const m = Math.floor((diffSec % 3600) / 60);
+    const s = diffSec % 60;
+    document.getElementById("countdown").textContent = pad(h) + ":" + pad(m) + ":" + pad(s);
+    document.getElementById("scan-name").textContent = label;
+  }
+
+  tick();
+  setInterval(tick, 1000);
+</script>
+""", height=110)
+
     st.divider()
     odds_fmt = st.selectbox(
         "Odds format",

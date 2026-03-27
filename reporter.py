@@ -26,6 +26,13 @@ Game date: {game_date}
 Bets placed and their outcomes:
 {bets_json}
 
+CLV (Closing Line Value) explanation for context: CLV measures whether we bet \
+at better odds than where the line eventually closed. A positive CLV means we \
+beat the market — the line moved against us after we bet, which is a sign of \
+genuine edge. Negative CLV means the line moved in our favour, suggesting the \
+market agreed we had the wrong side. CLV is expressed as a percentage — e.g. \
++2.5% means our implied probability was 2.5 points better than closing.
+
 Write the report using EXACTLY this structure (keep the headers):
 
 BETIQ DAILY REPORT — {game_date}
@@ -36,8 +43,16 @@ the final win/loss split, and the net P&L for the day.]
 
 {bet_sections}
 
+CLV PERFORMANCE
+[Only include this section if at least one bet has clv data (clv field is not null). \
+For each bet that has a clv value, show: "PICK — CLV: +X.X% / -X.X% (closing odds: ODDS)". \
+Then write 2-3 sentences explaining what the CLV numbers mean in plain English: \
+are we consistently beating the closing line? Is there evidence of real edge or luck? \
+If NO bets have clv data, write: "CLV data not yet available for this date — \
+closing odds are captured automatically and will appear in future reports."]
+
 DAILY SUMMARY
-Bets placed: [N] | Won: [N] | Lost: [N] | Net P&L: $[X]
+Bets placed: [N] | Won: [N] | Lost: [N] | Net P&L: $[X]{clv_summary_line}
 Key takeaway: [One concrete lesson or observation from today — something \
 you will apply to future scans.]
 
@@ -112,16 +127,18 @@ def _call_claude(game_date: str, bets: list) -> str:
 
     bets_summary = [
         {
-            "matchup":    b["matchup"],
-            "pick":       b["pick"],
-            "bet_type":   b["bet_type"],
-            "odds":       b["odds"],
-            "stake":      b["stake"],
-            "confidence": b["confidence"],
-            "edge_pct":   b["edge"],
-            "reasoning":  b["reasoning"] or "No reasoning recorded.",
-            "result":     b["status"],
-            "pnl":        b["pnl"],
+            "matchup":      b["matchup"],
+            "pick":         b["pick"],
+            "bet_type":     b["bet_type"],
+            "odds":         b["odds"],
+            "stake":        b["stake"],
+            "confidence":   b["confidence"],
+            "edge_pct":     b["edge"],
+            "reasoning":    b["reasoning"] or "No reasoning recorded.",
+            "result":       b["status"],
+            "pnl":          b["pnl"],
+            "closing_odds": b.get("closing_odds"),
+            "clv":          b.get("clv"),   # positive = beat closing line
         }
         for b in bets
     ]
@@ -132,10 +149,22 @@ def _call_claude(game_date: str, bets: list) -> str:
         for i, b in enumerate(bets_summary)
     )
 
+    # Pre-compute CLV summary line for DAILY SUMMARY
+    clv_values = [b["clv"] for b in bets_summary if b["clv"] is not None]
+    if clv_values:
+        avg_clv = sum(clv_values) / len(clv_values)
+        positive = sum(1 for v in clv_values if v > 0)
+        clv_summary_line = (
+            f" | Avg CLV: {avg_clv:+.2f}% ({positive}/{len(clv_values)} bets beat closing line)"
+        )
+    else:
+        clv_summary_line = ""
+
     prompt = _REPORT_PROMPT.format(
         game_date=game_date,
         bets_json=json.dumps(bets_summary, indent=2),
         bet_sections=bet_sections,
+        clv_summary_line=clv_summary_line,
     )
 
     response = client.messages.create(
@@ -191,6 +220,7 @@ def _save_pdf(game_date: str, narrative: str):
                 or stripped.startswith("WHY WE BET")
                 or stripped.startswith("RESULT:")
                 or stripped.startswith("SELF-EVALUATION")
+                or stripped.startswith("CLV PERFORMANCE")
             ):
                 pdf.set_font("Helvetica", "B", 10)
             else:
