@@ -64,6 +64,18 @@ SYSTEM_PROMPT = """You are BetIQ, an elite NBA sports betting analyst and autono
 - Call `snapshot_closing_odds` at every scan to capture pre-game closing lines for open bets
 - Check CLV trend in `get_bet_history` — if avg CLV is negative, you are entering bets too late (line has already moved against you); time picks earlier in the day
 
+## Runner-up bets (near misses)
+For EVERY game you analyse where you find a potential edge but decide NOT to bet, call `log_candidate_bet`.
+Common reasons to log:
+- Edge is 2–4% (interesting but below the 5% threshold)
+- All 5 slots are full and this pick isn't strong enough to swap in
+- Sharp money or line movement contradicts your model
+- Injury status unknown and it changes the pick materially
+- You like the pick but confidence is too low to stake real money on it
+
+Log these even for games you never fully analysed — if you glanced at the matchup and decided it wasn't worth deep analysis, log it with `edge_below_threshold` or `low_confidence`.
+The user uses these to understand what you almost bet and why, and to spot if you're being too conservative.
+
 ## Self-evaluation loop
 Before reasoning on any new pick, review `get_bet_history`. If recent win rate < 50%, lower confidence tiers. If high-confidence bets are losing, question your probability model. Log what you got right/wrong.
 
@@ -345,6 +357,40 @@ TOOLS = [
         },
     },
     {
+        "name": "log_candidate_bet",
+        "description": (
+            "Log a near-miss bet — a pick you analysed and liked but chose NOT to place. "
+            "Call this for EVERY game where you found a potential edge but decided not to bet. "
+            "These are displayed in the UI as 'Runner-Up Bets' so the user can track near-misses."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "matchup":     {"type": "string", "description": "e.g. 'Boston Celtics vs Miami Heat'"},
+                "pick":        {"type": "string", "description": "e.g. 'Boston Celtics ML' or 'Over 224.5'"},
+                "bet_type":    {"type": "string", "enum": ["moneyline", "spread", "total"], "description": "Bet type"},
+                "odds":        {"type": "integer", "description": "American odds at time of analysis"},
+                "edge_pct":    {"type": "number",  "description": "Your estimated edge % (can be < 5)"},
+                "confidence":  {"type": "string",  "enum": ["High", "Medium", "Low"]},
+                "skip_reason": {
+                    "type": "string",
+                    "enum": [
+                        "edge_below_threshold",
+                        "slots_full",
+                        "sharp_money_opposing",
+                        "injury_uncertainty",
+                        "line_moved_against",
+                        "low_confidence",
+                        "other",
+                    ],
+                    "description": "Primary reason you did not place this bet",
+                },
+                "reasoning": {"type": "string", "description": "Brief explanation of what you liked and why you passed"},
+            },
+            "required": ["matchup", "pick", "bet_type", "odds", "edge_pct", "confidence", "skip_reason"],
+        },
+    },
+    {
         "name": "snapshot_closing_odds",
         "description": (
             "For each open bet, look up current market odds and record them as the closing line. "
@@ -400,6 +446,7 @@ DISPATCH = {
     "get_bet_history":           lambda a: t.get_bet_history(),
     "resolve_bets":              lambda a: t.resolve_bets(),
     "snapshot_closing_odds":     lambda a: t.snapshot_closing_odds(),
+    "log_candidate_bet":         lambda a: t.log_candidate_bet(**a),
     "save_note":                 lambda a: t.save_note(**a),
     "get_notes":                 lambda a: t.get_notes(**a),
 }

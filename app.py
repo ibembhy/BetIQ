@@ -579,7 +579,7 @@ stats = bet_stats(resolved)
 
 # ── Main tabs ─────────────────────────────────────────────────────────────────
 
-tab_today, tab_chat, tab_history, tab_perf, tab_reports = st.tabs(["🏀 Today", "💬 Chat", "📋 Bet History", "📈 Performance", "📄 Daily Reports"])
+tab_today, tab_chat, tab_history, tab_perf, tab_reports, tab_runners = st.tabs(["🏀 Today", "💬 Chat", "📋 Bet History", "📈 Performance", "📄 Daily Reports", "👀 Runner-Up Bets"])
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1074,3 +1074,68 @@ with tab_reports:
                     st.write(stripped)
         else:
             st.error("Could not read report file.")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TAB 5 — Runner-Up Bets
+# ═══════════════════════════════════════════════════════════════════════════════
+
+with tab_runners:
+    st.markdown("### Runner-Up Bets")
+    st.caption("Picks the agent analysed and liked but chose not to place — and why.")
+
+    candidates = db.get_candidate_bets(limit=100)
+
+    if not candidates:
+        st.info("No runner-up bets logged yet. They'll appear here after the next scan.")
+    else:
+        # ── Filter row ──
+        col_d, col_r, _ = st.columns([1, 1, 3])
+        dates_avail = sorted({c["game_date"] for c in candidates}, reverse=True)
+        date_filter = col_d.selectbox("Date", ["All"] + dates_avail, key="runner_date")
+
+        _SKIP_LABELS = {
+            "edge_below_threshold": "Edge below 5%",
+            "slots_full":           "Slots full",
+            "sharp_money_opposing": "Sharp money opposing",
+            "injury_uncertainty":   "Injury uncertainty",
+            "line_moved_against":   "Line moved against",
+            "low_confidence":       "Low confidence",
+            "other":                "Other",
+        }
+        reason_filter = col_r.selectbox("Skip reason", ["All"] + list(_SKIP_LABELS.values()), key="runner_reason")
+
+        filtered_c = candidates
+        if date_filter != "All":
+            filtered_c = [c for c in filtered_c if c["game_date"] == date_filter]
+        if reason_filter != "All":
+            inv = {v: k for k, v in _SKIP_LABELS.items()}
+            filtered_c = [c for c in filtered_c if c["skip_reason"] == inv.get(reason_filter)]
+
+        st.markdown(f"**{len(filtered_c)} near-miss(es)**")
+        st.divider()
+
+        for c in filtered_c:
+            skip_label = _SKIP_LABELS.get(c["skip_reason"], c["skip_reason"])
+            odds_fmt   = fo(c["odds"]) if c["odds"] else "—"
+            edge_color = "orange" if c["edge_pct"] >= 3 else ""
+            conf_cls   = "badge-high" if c["confidence"] == "High" else "badge-med"
+
+            st.markdown(f"""
+            <div class="bet-card open" style="border-left-color: #f59e0b;">
+                <div style="display:flex; justify-content:space-between; align-items:flex-start;">
+                    <div>
+                        <div class="bet-pick">{c['pick']}</div>
+                        <div class="bet-meta">{c['matchup']} &nbsp;·&nbsp; {c['game_date']}</div>
+                    </div>
+                    <div style="text-align:right;">
+                        <div class="stat-value {edge_color}" style="font-size:1rem;">{c['edge_pct']:+.1f}% edge</div>
+                        <div class="bet-meta">{c['bet_type'].title()} @ {odds_fmt}</div>
+                    </div>
+                </div>
+                <div style="margin-top:8px;">
+                    <span class="bet-badge {conf_cls}">{c['confidence']}</span>
+                    <span class="bet-badge" style="background:#422006;color:#fb923c;">⏭ {skip_label}</span>
+                </div>
+                {f'<div class="bet-meta" style="margin-top:8px;">{c["reasoning"]}</div>' if c.get("reasoning") else ""}
+            </div>""", unsafe_allow_html=True)

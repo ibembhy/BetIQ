@@ -81,6 +81,22 @@ def init_db():
         except Exception:
             pass  # Column already exists
 
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS candidate_bets (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            game_date  TEXT    NOT NULL,
+            matchup    TEXT    NOT NULL,
+            pick       TEXT    NOT NULL,
+            bet_type   TEXT    NOT NULL,
+            odds       INTEGER NOT NULL,
+            edge_pct   REAL    NOT NULL,
+            confidence TEXT    NOT NULL,
+            skip_reason TEXT   NOT NULL,
+            reasoning  TEXT,
+            logged_at  TEXT    NOT NULL
+        )
+    """)
+
     # Seed bankroll on first run
     c.execute("SELECT COUNT(*) FROM bankroll")
     if c.fetchone()[0] == 0:
@@ -274,5 +290,44 @@ def get_agent_notes(note_type: str = None, limit: int = 30) -> list:
             "SELECT * FROM agent_notes ORDER BY created_at DESC LIMIT ?",
             (limit,),
         ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def save_candidate_bet(
+    game_date: str,
+    matchup: str,
+    pick: str,
+    bet_type: str,
+    odds: int,
+    edge_pct: float,
+    confidence: str,
+    skip_reason: str,
+    reasoning: str = "",
+):
+    conn = get_connection()
+    conn.execute(
+        """
+        INSERT INTO candidate_bets
+            (game_date, matchup, pick, bet_type, odds, edge_pct,
+             confidence, skip_reason, reasoning, logged_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            game_date, matchup, pick, bet_type, odds,
+            round(edge_pct, 2), confidence, skip_reason,
+            reasoning, datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_candidate_bets(limit: int = 50) -> list:
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT * FROM candidate_bets ORDER BY logged_at DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
     conn.close()
     return [dict(r) for r in rows]

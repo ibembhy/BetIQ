@@ -1045,6 +1045,46 @@ def get_notes(note_type: str = None, limit: int = 30) -> dict:
     }
 
 
+def log_candidate_bet(
+    matchup: str,
+    pick: str,
+    bet_type: str,
+    odds: int,
+    edge_pct: float,
+    confidence: str,
+    skip_reason: str,
+    reasoning: str = "",
+) -> dict:
+    """
+    Log a near-miss bet — a pick you analysed and liked but decided NOT to place.
+    Use this whenever you find a potential edge but can't bet it (slots full,
+    edge below threshold, uncertainty too high, sharp money opposing, etc.).
+    These are shown in the UI as 'Runner-Up Bets' for the user to review.
+
+    skip_reason options (use the most accurate):
+      'edge_below_threshold' — edge found but < 5%
+      'slots_full'           — all 5 slots already occupied
+      'sharp_money_opposing' — public/sharp signals contradict the pick
+      'injury_uncertainty'   — key injury status unknown
+      'line_moved_against'   — line moved unfavourably since opening
+      'low_confidence'       — data too thin or conflicting to bet confidently
+      'other'                — explain in reasoning
+    """
+    game_date = date.today().isoformat()
+    db.save_candidate_bet(
+        game_date=game_date,
+        matchup=matchup,
+        pick=pick,
+        bet_type=bet_type,
+        odds=odds,
+        edge_pct=edge_pct,
+        confidence=confidence,
+        skip_reason=skip_reason,
+        reasoning=reasoning,
+    )
+    return {"logged": True, "pick": pick, "skip_reason": skip_reason}
+
+
 def snapshot_closing_odds() -> dict:
     """
     For each open bet, look up current market odds and store them as the closing line.
