@@ -1,0 +1,278 @@
+"""
+BetIQ — SQLite database layer.
+Tables: bankroll, bets, agent_notes
+"""
+
+import sqlite3
+import os
+from datetime import datetime, timezone
+
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "betiq.db")
+
+
+def get_connection() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    conn = get_connection()
+    c = conn.cursor()
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS bankroll (
+            id         INTEGER PRIMARY KEY,
+            balance    REAL    NOT NULL DEFAULT 1000.0,
+            updated_at TEXT    NOT NULL
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS bets (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            game_date        TEXT    NOT NULL,
+            matchup          TEXT    NOT NULL,
+            pick             TEXT    NOT NULL,
+            bet_type         TEXT    NOT NULL,
+            odds             INTEGER NOT NULL,
+            stake            REAL    NOT NULL,
+            potential_payout REAL    NOT NULL,
+            confidence       TEXT    NOT NULL,
+            edge             REAL    NOT NULL,
+            reasoning        TEXT,
+            status           TEXT    NOT NULL DEFAULT 'open',
+            pnl              REAL    DEFAULT 0.0,
+            placed_at        TEXT    NOT NULL,
+            resolved_at      TEXT
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS agent_notes (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            note_type  TEXT NOT NULL,
+            content    TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS odds_snapshots (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            captured_at     TEXT NOT NULL,
+            home_team       TEXT NOT NULL,
+            away_team       TEXT NOT NULL,
+            home_ml         INTEGER,
+            away_ml         INTEGER,
+            home_spread     REAL,
+            home_spread_price INTEGER,
+            away_spread_price INTEGER,
+            total_line      REAL,
+            over_price      INTEGER,
+            under_price     INTEGER
+        )
+    """)
+
+    # Add CLV columns to existing databases that predate this feature
+    for col, definition in [("closing_odds", "INTEGER"), ("clv", "REAL")]:
+        try:
+            c.execute(f"ALTER TABLE bets ADD COLUMN {col} {definition}")
+        except Exception:
+            pass  # Column already exists
+
+    # Seed bankroll on first run
+    c.execute("SELECT COUNT(*) FROM bankroll")
+    if c.fetchone()[0] == 0:
+        c.execute(
+            "INSERT INTO bankroll (balance, updated_at) VALUES (?, ?)",
+            (1000.0, datetime.now(timezone.utc).isoformat()),
+        )
+
+    conn.commit()
+    conn.close()
+
+
+# ── Bankroll ──────────────────────────────────────────────────────────────────
+
+def get_balance() -> float:
+    conn = get_connection()
+    row = conn.execute("SELECT balance FROM bankroll ORDER BY id DESC LIMIT 1").fetchone()
+    conn.close()
+    return row["balance"] if row else 1000.0
+
+
+def update_balance(new_balance: float):
+    conn = get_connection()
+    conn.execute(
+        "UPDATE bankroll SET balance=?, updated_at=? WHERE id=(SELECT MAX(id) FROM bankroll)",
+        (round(new_balance, 2), datetime.now(timezone.utc).isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+
+# ── Bets ──────────────────────────────────────────────────────────────────────
+
+def insert_bet(bet: dict) -> int:
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute(
+        """
+        INSERT INTO bets
+            (game_date, matchup, pick, bet_type, odds, stake, potential_payout,
+             confidence, edge, reasoning, status, placed_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,'open',?)
+        """,
+        (
+            bet["game_date"], bet["matchup"], bet["pick"], bet["bet_type"],
+            bet["odds"], bet["stake"], bet["potential_payout"],
+            bet["confidence"], bet["edge"], bet["reasoning"],
+            datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+    bet_id = c.lastrowid
+    conn.commit()
+    conn.close()
+    return bet_id
+
+
+def get_open_bets() -> list:
+    conn = get_connection()
+    rows = [dict(r) for r in conn.execute(
+        "SELECT * FROM bets WHERE status='open' ORDER BY placed_at DESC"
+    ).fetchall()]
+    conn.close()
+    return rows
+
+
+def get_all_bets() -> list:
+    conn = get_connection()
+    rows = [dict(r) for r in conn.execute(
+        "SELECT * FROM bets ORDER BY placed_at DESC"
+    ).fetchall()]
+    conn.close()
+    return rows
+
+
+def cancel_bet(bet_id: int) -> dict | None:
+    """Cancel an open bet and refund the stake. Returns the cancelled bet or None if not found."""
+    conn = get_connection()
+    row = conn.execute("SELECT * FROM bets WHERE id=? AND status='open'", (bet_id,)).fetchone()
+    if not row:
+        conn.close()
+        return None
+    bet = dict(row)
+    conn.execute(
+        "UPDATE bets SET status='cancelled', resolved_at=? WHERE id=?",
+        (datetime.now(timezone.utc).isoformat(), bet_id),
+    )
+    conn.commit()
+    conn.close()
+    return bet
+
+
+def update_bet_clv(bet_id: int, closing_odds: int, clv: float):
+    """Store the closing line odds and computed CLV for a bet."""
+    conn = get_connection()
+    conn.execute(
+        "UPDATE bets SET closing_odds=?, clv=? WHERE id=?",
+        (closing_odds, round(clv, 4), bet_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def resolve_bet(bet_id: int, status: str, pnl: float):
+    conn = get_connection()
+    conn.execute(
+        "UPDATE bets SET status=?, pnl=?, resolved_at=? WHERE id=?",
+        (status, round(pnl, 2), datetime.now(timezone.utc).isoformat(), bet_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_weekly_pnl() -> dict:
+    conn = get_connection()
+    row = conn.execute("""
+        SELECT
+            COALESCE(SUM(CASE WHEN status='won'  THEN pnl ELSE 0 END),0) AS total_won,
+            COALESCE(SUM(CASE WHEN status='lost' THEN pnl ELSE 0 END),0) AS total_lost,
+            COUNT(CASE WHEN status='won'  THEN 1 END) AS wins,
+            COUNT(CASE WHEN status='lost' THEN 1 END) AS losses,
+            COALESCE(SUM(pnl),0) AS net_pnl
+        FROM bets
+        WHERE resolved_at >= datetime('now','-7 days')
+          AND status IN ('won','lost')
+    """).fetchone()
+    conn.close()
+    return dict(row) if row else {"wins": 0, "losses": 0, "net_pnl": 0}
+
+
+def save_odds_snapshot(home_team: str, away_team: str, snapshot: dict):
+    conn = get_connection()
+    conn.execute(
+        """
+        INSERT INTO odds_snapshots
+            (captured_at, home_team, away_team,
+             home_ml, away_ml,
+             home_spread, home_spread_price, away_spread_price,
+             total_line, over_price, under_price)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            datetime.now(timezone.utc).isoformat(),
+            home_team, away_team,
+            snapshot.get("home_ml"), snapshot.get("away_ml"),
+            snapshot.get("home_spread"), snapshot.get("home_spread_price"),
+            snapshot.get("away_spread_price"),
+            snapshot.get("total_line"), snapshot.get("over_price"),
+            snapshot.get("under_price"),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_odds_snapshots(home_team: str, away_team: str, limit: int = 10) -> list:
+    conn = get_connection()
+    rows = conn.execute(
+        """
+        SELECT * FROM odds_snapshots
+        WHERE (home_team LIKE ? AND away_team LIKE ?)
+           OR (home_team LIKE ? AND away_team LIKE ?)
+        ORDER BY captured_at ASC
+        LIMIT ?
+        """,
+        (f"%{home_team}%", f"%{away_team}%",
+         f"%{away_team}%", f"%{home_team}%", limit),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def add_agent_note(note_type: str, content: str):
+    conn = get_connection()
+    conn.execute(
+        "INSERT INTO agent_notes (note_type, content, created_at) VALUES (?,?,?)",
+        (note_type, content, datetime.now(timezone.utc).isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_agent_notes(note_type: str = None, limit: int = 30) -> list:
+    conn = get_connection()
+    if note_type:
+        rows = conn.execute(
+            "SELECT * FROM agent_notes WHERE note_type=? ORDER BY created_at DESC LIMIT ?",
+            (note_type, limit),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM agent_notes ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]

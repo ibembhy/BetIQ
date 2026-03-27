@@ -1,0 +1,22 @@
+# Secrets — never commit
+.env
+
+# Database & generated files
+betiq.db
+reports/
+runner.log
+*.log
+
+# Kaggle dataset — too large for GitHub (4.4 GB)
+data/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db

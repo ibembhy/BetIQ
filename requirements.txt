@@ -1,0 +1,8 @@
+anthropic>=0.40.0
+streamlit>=1.35.0
+requests>=2.31.0
+python-dotenv>=1.0.0
+pandas>=2.0.0
+apscheduler>=3.10.0
+pytz>=2024.1
+fpdf2>=2.7.0
