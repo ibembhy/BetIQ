@@ -3,9 +3,11 @@ BetIQ — Streamlit frontend.
 Run with: streamlit run app.py
 """
 
+from dotenv import load_dotenv
+load_dotenv()
+
 import streamlit as st
 import pandas as pd
-from dotenv import load_dotenv
 from datetime import datetime
 
 import database as db
@@ -14,7 +16,6 @@ import reporter
 import html as _html
 from agent import run_agent, run_lite_agent
 
-load_dotenv()
 db.init_db()
 
 # ── Page config ───────────────────────────────────────────────────────────────
@@ -368,6 +369,21 @@ def confidence_badge(conf: str) -> str:
 def edge_badge(edge: float) -> str:
     return f'<span class="bet-badge badge-edge">Edge {edge:.1f}%</span>'
 
+_EDGE_TYPE_ICONS = {
+    "injury":        ("🤕", "#f97316"),
+    "line_movement": ("📈", "#6366f1"),
+    "public_fade":   ("🐟", "#06b6d4"),
+    "rest_fatigue":  ("😴", "#a855f7"),
+    "statistical":   ("📊", "#22c55e"),
+    "multiple":      ("⚡", "#f59e0b"),
+}
+def edge_type_badge(et: str) -> str:
+    if not et:
+        return ""
+    icon, color = _EDGE_TYPE_ICONS.get(et, ("", "#64748b"))
+    label = et.replace("_", " ").title()
+    return f'<span class="bet-badge" style="background:#0f172a;color:{color};border:1px solid {color};">{icon} {label}</span>'
+
 def status_badge(status: str) -> str:
     icons = {"open": "🔵 Open", "won": "✅ Won", "lost": "❌ Lost", "cancelled": "⚪ Cancelled", "push": "➡️ Push"}
     cls   = {"open": "badge-open", "won": "badge-won", "lost": "badge-lost"}.get(status, "badge-open")
@@ -408,6 +424,18 @@ with st.sidebar:
         </div>
     </div>
     """, unsafe_allow_html=True)
+
+    # ── Navigation ──
+    page = st.radio(
+        "Navigation",
+        ["🏀 Today", "💬 Chat", "📋 Bet History", "📈 Performance",
+         "📄 Daily Reports", "👀 Runner-Up Bets", "🔄 Replaced Bets",
+         "🔍 Bet Reports", "🔌 API Usage"],
+        label_visibility="collapsed",
+        key="nav_page",
+    )
+
+    st.divider()
 
     # ── Bankroll ──
     br       = t.get_bankroll()
@@ -461,7 +489,16 @@ with st.sidebar:
     st.markdown(f'<div class="section-header">Open Bets &nbsp; {len(open_bets)}/5 slots used</div>', unsafe_allow_html=True)
 
     if not open_bets:
-        st.caption("No open bets — scanner will place bets at next scan.")
+        from datetime import date as _d
+        _today = _d.today().isoformat()
+        _candidates = [c for c in db.get_candidate_bets(limit=50) if c.get("game_date") == _today or c.get("logged_at", "")[:10] == _today]
+        if _candidates:
+            st.caption(f"Last scan: no edge found. {len(_candidates)} game(s) analyzed — edge too low or bankroll rules not met.")
+            with st.expander("See why", expanded=False):
+                for _c in _candidates[:5]:
+                    st.markdown(f"**{_c['pick']}** ({_c['matchup']})  \n_{_c['skip_reason']}_ · Edge: {_c['edge_pct']:.1f}%")
+        else:
+            st.caption("No open bets — scanner will place bets at next scan.")
     else:
         for bet in open_bets:
             reasoning_html = f'<div class="bet-meta" style="margin-top:6px;font-style:italic;">{bet["reasoning"]}</div>' if bet.get("reasoning") else ""
@@ -531,8 +568,9 @@ with st.sidebar:
 </div>
 <script>
   const SCANS = [
-    { hour: 14, minute: 0, label: "Afternoon (2:00 PM)" },
-    { hour: 18, minute: 0, label: "Evening (6:00 PM)"   },
+    { hour: 14, minute:  0, label: "Afternoon (2:00 PM)"          },
+    { hour: 18, minute:  0, label: "Evening (6:00 PM)"            },
+    { hour: 20, minute: 30, label: "Closing Snapshot (8:30 PM)"   },
   ];
 
   function nextScan() {
@@ -549,7 +587,7 @@ with st.sidebar:
         return { label: scan.label, diffSec: scanSec - nowSec };
       }
     }
-    // Past 6:00 PM — next is tomorrow's 2 PM
+    // Past 8:30 PM — next is tomorrow's 2 PM
     return { label: "Afternoon (2:00 PM)", diffSec: (14 * 3600) + (86400 - nowSec) };
   }
 
@@ -588,16 +626,16 @@ resolved = sorted(
 )
 stats = bet_stats(resolved)
 
-# ── Main tabs ─────────────────────────────────────────────────────────────────
+# ── Main content (driven by sidebar nav) ──────────────────────────────────────
 
-tab_today, tab_chat, tab_history, tab_perf, tab_reports, tab_runners, tab_replaced = st.tabs(["🏀 Today", "💬 Chat", "📋 Bet History", "📈 Performance", "📄 Daily Reports", "👀 Runner-Up Bets", "🔄 Replaced Bets"])
+page = st.session_state.get("nav_page", "🏀 Today")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # TAB 1 — Today
 # ═══════════════════════════════════════════════════════════════════════════════
 
-with tab_today:
+if page == "🏀 Today":
     from datetime import date as _date_cls
     today_str = _date_cls.today().strftime("%A, %B %d")
     st.markdown(f"### {today_str}")
@@ -848,7 +886,7 @@ with tab_today:
 
 # ═══════════════════════════════════════════════════════════════════════════════
 
-with tab_chat:
+elif page == "💬 Chat":
     st.markdown("### Ask BetIQ anything")
 
     # Session state
@@ -926,7 +964,7 @@ with tab_chat:
 # TAB 2 — Bet History
 # ═══════════════════════════════════════════════════════════════════════════════
 
-with tab_history:
+elif page == "📋 Bet History":
     if not all_bets:
         st.info("No bets placed yet. Use the chat or wait for the next scheduled scan.")
     else:
@@ -941,15 +979,27 @@ with tab_history:
         st.divider()
 
         # ── Filter controls ──
-        col_f1, col_f2, _ = st.columns([1, 1, 3])
+        col_f1, col_f2, col_f3 = st.columns([1, 1, 1])
         status_filter = col_f1.selectbox("Status", ["All", "Open", "Won", "Lost", "Cancelled"])
         type_filter   = col_f2.selectbox("Type",   ["All", "Moneyline", "Spread", "Total"])
+        period_filter = col_f3.selectbox("Period",  ["All Time", "Today", "This Week", "This Month"])
+
+        from datetime import date, timedelta
+        _today = date.today()
+        _period_map = {
+            "Today":      _today,
+            "This Week":  _today - timedelta(days=_today.weekday()),
+            "This Month": _today.replace(day=1),
+        }
 
         filtered = all_bets
         if status_filter != "All":
             filtered = [b for b in filtered if b["status"] == status_filter.lower()]
         if type_filter != "All":
             filtered = [b for b in filtered if b["bet_type"] == type_filter.lower()]
+        if period_filter != "All Time":
+            cutoff = _period_map[period_filter]
+            filtered = [b for b in filtered if b.get("game_date", "") >= str(cutoff)]
 
         st.markdown(f"**{len(filtered)} bets**")
 
@@ -973,6 +1023,7 @@ with tab_history:
                     {status_badge(b['status'])}
                     {confidence_badge(b['confidence'])}
                     {edge_badge(b['edge'])}
+                    {edge_type_badge(b.get('edge_type', ''))}
                     <span class="bet-badge badge-open">Stake ${b['stake']:.2f}</span>
                 </div>
                 {reasoning_html}
@@ -983,16 +1034,22 @@ with tab_history:
 # TAB 3 — Performance
 # ═══════════════════════════════════════════════════════════════════════════════
 
-with tab_perf:
+elif page == "📈 Performance":
     if not resolved:
         st.info("Performance analytics will appear here once bets are settled.")
     else:
         # ── Top KPIs ──
-        k1, k2, k3, k4 = st.columns(4)
+        clv_values = [b["clv"] * 100 for b in resolved if b.get("clv") is not None]
+        avg_clv    = sum(clv_values) / len(clv_values) if clv_values else None
+        clv_str    = f"{avg_clv:+.2f}%" if avg_clv is not None else "—"
+        clv_color  = "normal" if avg_clv is None else ("normal" if avg_clv >= 0 else "inverse")
+
+        k1, k2, k3, k4, k5 = st.columns(5)
         k1.metric("Win Rate",      f"{stats['win_rate']:.1f}%")
         k2.metric("Net P&L",       f"${stats['total_pnl']:+.2f}")
         k3.metric("ROI",           f"{stats['roi']:.1f}%")
-        k4.metric("Bets Resolved", len(resolved))
+        k4.metric("Avg CLV",       clv_str, delta=clv_str if avg_clv is not None else None, delta_color=clv_color)
+        k5.metric("Bets Resolved", len(resolved))
 
         st.divider()
 
@@ -1041,11 +1098,28 @@ with tab_perf:
             if rows:
                 st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
+        edge_types_present = list({b.get("edge_type") for b in resolved if b.get("edge_type")})
+        if edge_types_present:
+            st.markdown("### By Edge Type")
+            et_rows = _group_stats(resolved, "edge_type", edge_types_present, "Edge Type")
+            if et_rows:
+                # add icons
+                for r in et_rows:
+                    icon, _ = _EDGE_TYPE_ICONS.get(r["Edge Type"].lower().replace(" ", "_"), ("", ""))
+                    r["Edge Type"] = f"{icon} {r['Edge Type']}" if icon else r["Edge Type"]
+                st.dataframe(pd.DataFrame(et_rows), use_container_width=True, hide_index=True)
+
         st.divider()
 
         # ── Last 10 results ──
         st.markdown("### Recent Results")
         for b in list(reversed(resolved))[:10]:
+            clv_val = b.get("clv")
+            if clv_val is not None:
+                clv_color_cls = "#22c55e" if clv_val >= 0 else "#ef4444"
+                clv_html = f'<span class="bet-badge" style="background:#0f172a;color:{clv_color_cls};border:1px solid {clv_color_cls};">CLV {clv_val * 100:+.2f}%</span>'
+            else:
+                clv_html = ""
             st.markdown(f"""
             <div class="bet-card {b['status']}">
                 <div style="display:flex; justify-content:space-between;">
@@ -1062,6 +1136,7 @@ with tab_perf:
                     {status_badge(b['status'])}
                     {confidence_badge(b['confidence'])}
                     {edge_badge(b['edge'])}
+                    {clv_html}
                 </div>
             </div>""", unsafe_allow_html=True)
 
@@ -1070,7 +1145,7 @@ with tab_perf:
 # TAB 4 — Daily Reports
 # ═══════════════════════════════════════════════════════════════════════════════
 
-with tab_reports:
+elif page == "📄 Daily Reports":
     st.markdown("### Daily Betting Reports")
     st.caption("Reports are generated automatically when the last bet of each game day resolves.")
 
@@ -1153,7 +1228,7 @@ with tab_reports:
 # TAB 5 — Runner-Up Bets
 # ═══════════════════════════════════════════════════════════════════════════════
 
-with tab_runners:
+elif page == "👀 Runner-Up Bets":
     st.markdown("### Runner-Up Bets")
     st.caption("Picks the agent analysed and liked but chose not to place — and why.")
 
@@ -1199,7 +1274,7 @@ with tab_runners:
                 <div style="display:flex; justify-content:space-between; align-items:flex-start;">
                     <div>
                         <div class="bet-pick">{c['pick']}</div>
-                        <div class="bet-meta">{c['matchup']} &nbsp;·&nbsp; {c['game_date']}</div>
+                        <div class="bet-meta">{c['matchup']} &nbsp;·&nbsp; {c['game_date']} &nbsp;·&nbsp; {(__import__('datetime').datetime.fromisoformat(c['logged_at'].replace('Z','+00:00')).astimezone(__import__('pytz').timezone('America/New_York')).strftime('%I:%M %p EST') if c.get('logged_at') else '')}</div>
                     </div>
                     <div style="text-align:right;">
                         <div class="stat-value {edge_color}" style="font-size:1rem;">{c['edge_pct']:+.1f}% edge</div>
@@ -1218,7 +1293,7 @@ with tab_runners:
 # TAB 6 — Replaced Bets
 # ═══════════════════════════════════════════════════════════════════════════════
 
-with tab_replaced:
+elif page == "🔄 Replaced Bets":
     st.markdown("### Replaced Bets")
     st.caption("Bets the agent cancelled and swapped out for a stronger pick.")
 
@@ -1286,6 +1361,165 @@ with tab_replaced:
                 </div>
 
             </div>""", unsafe_allow_html=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TAB 7 — Bet Reports
+# ═══════════════════════════════════════════════════════════════════════════════
+
+elif page == "🔍 Bet Reports":
+    st.markdown("### Bet Reports")
+    st.caption("Post-game analysis generated by AI after each bet is settled.")
+
+    bets_with_reports = [b for b in all_bets if b.get("bet_report") and b["status"] in ("won", "lost")]
+
+    if not bets_with_reports:
+        st.info("Reports will appear here after bets are resolved. Each settled bet gets an automatic AI analysis.")
+    else:
+        for b in bets_with_reports:
+            pnl_color_val = "#22c55e" if b["pnl"] >= 0 else "#ef4444"
+            pnl_str = f"+${b['pnl']:.2f}" if b["pnl"] >= 0 else f"-${abs(b['pnl']):.2f}"
+            outcome_icon = "✅" if b["status"] == "won" else "❌"
+
+            st.markdown(f"""
+            <div class="bet-card {b['status']}" style="margin-bottom:16px;">
+                <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:10px;">
+                    <div>
+                        <div class="bet-pick">{outcome_icon} {b['pick']}</div>
+                        <div class="bet-meta">{b['matchup']} &nbsp;·&nbsp; {b['game_date']} &nbsp;·&nbsp; {b['bet_type'].title()} @ {fo(b['odds'])}</div>
+                    </div>
+                    <div style="text-align:right;">
+                        <div style="font-size:1.1rem;font-weight:700;color:{pnl_color_val};">{pnl_str}</div>
+                        <div class="bet-meta">Stake ${b['stake']:.2f}</div>
+                    </div>
+                </div>
+                <div style="background:#0f172a;border-radius:8px;padding:12px;font-size:0.85rem;line-height:1.6;color:#cbd5e1;white-space:pre-wrap;">{_html.escape(b['bet_report'])}</div>
+            </div>""", unsafe_allow_html=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TAB 8 — API Usage
+# ═══════════════════════════════════════════════════════════════════════════════
+
+elif page == "🔌 API Usage":
+    st.markdown("### API Usage")
+    st.caption("All API calls logged locally — no external cost to view this.")
+
+    usage = db.get_api_usage()
+
+    if not usage:
+        st.info("No API calls logged yet. Data appears after the next scan.")
+    else:
+        from datetime import date as _date_cls, timedelta as _td
+        import pandas as _pd
+
+        today_str    = _date_cls.today().isoformat()
+        week_start   = (_date_cls.today() - _td(days=_date_cls.today().weekday())).isoformat()
+        month_start  = _date_cls.today().replace(day=1).isoformat()
+
+        def _count(rows, since=None, cached=None):
+            r = rows
+            if since:
+                r = [x for x in r if x["called_at"] >= since]
+            if cached is not None:
+                r = [x for x in r if bool(x["cached"]) == cached]
+            return len(r)
+
+        # ── Claude cost helpers ──
+        # Prices per million tokens (input / output)
+        _CLAUDE_PRICES = {
+            "claude-sonnet-4-6":          (3.00, 15.00),
+            "claude-sonnet-4-6 (prefetch)":(3.00, 15.00),
+            "claude-haiku-4-5 (bet report)":(0.80,  4.00),
+            "claude-haiku-4-5 (chat)":    (0.80,  4.00),
+        }
+
+        def _row_cost(row):
+            inp = row.get("input_tokens") or 0
+            out = row.get("output_tokens") or 0
+            model = row.get("endpoint", "")
+            pi, po = _CLAUDE_PRICES.get(model, (3.00, 15.00))
+            return (inp * pi + out * po) / 1_000_000
+
+        def _total_cost(rows, since=None):
+            r = rows if not since else [x for x in rows if x["called_at"] >= since]
+            return sum(_row_cost(x) for x in r)
+
+        # ── Summary KPIs ──
+        odds_rows = [x for x in usage if x["api"] == "Odds API"]
+        claude_rows = [x for x in usage if x["api"] == "Anthropic"]
+
+        cost_today    = _total_cost(claude_rows, since=today_str)
+        cost_month    = _total_cost(claude_rows, since=month_start)
+        cost_alltime  = _total_cost(claude_rows)
+
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Total Calls (All Time)", len(usage))
+        k2.metric("Odds API This Month",    _count(odds_rows, since=month_start, cached=False),
+                  help="Real calls that count against your 500/month quota")
+        k3.metric("Claude Cost Today",      f"${cost_today:.4f}")
+        k4.metric("Claude Cost This Month", f"${cost_month:.3f}")
+
+        st.caption(f"All-time Claude spend: **${cost_alltime:.3f}**")
+
+        st.divider()
+
+        # ── Per-API breakdown ──
+        apis = sorted({x["api"] for x in usage})
+        rows = []
+        for api in apis:
+            api_rows = [x for x in usage if x["api"] == api]
+            real     = _count(api_rows, cached=False)
+            cached_c = _count(api_rows, cached=True)
+            today_c  = _count(api_rows, since=today_str)
+            week_c   = _count(api_rows, since=week_start)
+            month_c  = _count(api_rows, since=month_start)
+            row = {
+                "API":         api,
+                "Today":       today_c,
+                "This Week":   week_c,
+                "This Month":  month_c,
+                "All Time":    len(api_rows),
+                "Cached Hits": cached_c,
+                "Real Calls":  real,
+            }
+            if api == "Anthropic":
+                row["Cost (All Time)"] = f"${_total_cost(api_rows):.4f}"
+                row["Cost (Month)"]    = f"${_total_cost(api_rows, since=month_start):.4f}"
+            rows.append(row)
+
+        st.markdown("#### Breakdown by API")
+        st.dataframe(_pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+        # ── Odds API quota warning ──
+        odds_month = _count(odds_rows, since=month_start, cached=False)
+        if odds_month >= 400:
+            st.error(f"⚠️ Odds API: {odds_month}/500 credits used this month — running low!")
+        elif odds_month >= 250:
+            st.warning(f"Odds API: {odds_month}/500 credits used this month.")
+        else:
+            st.success(f"Odds API: {odds_month}/500 credits used this month — on track.")
+
+        st.divider()
+
+        # ── Recent call log ──
+        st.markdown("#### Recent Calls (last 50)")
+        recent = usage[:50]
+        log_rows = []
+        for x in recent:
+            row = {
+                "Time":     x["called_at"][:19].replace("T", " "),
+                "API":      x["api"],
+                "Endpoint": x["endpoint"],
+                "Cached":   "✓" if x["cached"] else "",
+            }
+            if x["api"] == "Anthropic":
+                inp = x.get("input_tokens") or 0
+                out = x.get("output_tokens") or 0
+                row["Tokens (in/out)"] = f"{inp:,} / {out:,}" if (inp or out) else "—"
+                row["Cost"]            = f"${_row_cost(x):.5f}" if (inp or out) else "—"
+            log_rows.append(row)
+        st.dataframe(_pd.DataFrame(log_rows), use_container_width=True, hide_index=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

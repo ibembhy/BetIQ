@@ -15,9 +15,22 @@ load_dotenv()
 
 client = Anthropic()
 
+def _log_claude(model: str, response=None):
+    inp = getattr(getattr(response, "usage", None), "input_tokens", 0) or 0
+    out = getattr(getattr(response, "usage", None), "output_tokens", 0) or 0
+    db.log_api_call("Anthropic", model, input_tokens=inp, output_tokens=out)
+
 # ── System prompt ─────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = """You are BetIQ, an elite NBA sports betting analyst and autonomous paper trader.
+
+## ⚠️ CRITICAL — Anti-hallucination rules (NEVER violate these)
+- Your training data about NBA rosters, trades, and player status is OUTDATED. Do NOT rely on it.
+- **Only reference players that appear in the injury report or roster data provided to you.**
+- If a player is not listed in the provided data, assume they are NOT on that team. Do not mention them.
+- Never invent or assume statistics, scores, or outcomes not present in the provided data.
+- If key data is missing, say "data unavailable" — do not fill gaps with your training knowledge.
+- Ground every claim in the specific numbers from the fetched data. No guessing.
 
 ## Your analytical process (NEVER skip steps)
 
@@ -69,6 +82,7 @@ SYSTEM_PROMPT = """You are BetIQ, an elite NBA sports betting analyst and autono
 - Never bet below 5% edge
 - Never exceed 5 open bets simultaneously
 - Always call `get_bankroll` immediately before `place_paper_bet`
+- Always set `edge_type` — classify the primary reason for the edge: "injury" (key player out), "line_movement" (sharp money moved the line), "public_fade" (fading heavy public side), "rest_fatigue" (back-to-back or rest advantage), "statistical" (model edge from stats alone), "multiple" (two or more factors)
 
 ## Closing Line Value (CLV)
 - CLV = closing_implied_probability − your_implied_probability (positive = you beat the market = long-term profitability signal)
@@ -321,8 +335,9 @@ TOOLS = [
                 "reasoning":       {"type": "string",  "description": "Why this bet has edge"},
                 "game_date":       {"type": "string",  "description": "YYYY-MM-DD format"},
                 "replaces_bet_id": {"type": "integer", "description": "ID of the cancelled bet this replaces (only set when swapping)"},
+                "edge_type":       {"type": "string",  "enum": ["injury", "line_movement", "public_fade", "rest_fatigue", "statistical", "multiple"], "description": "Primary reason for the edge"},
             },
-            "required": ["matchup", "pick", "bet_type", "odds", "confidence", "edge", "reasoning"],
+            "required": ["matchup", "pick", "bet_type", "odds", "confidence", "edge", "reasoning", "edge_type"],
         },
     },
     {
@@ -522,6 +537,7 @@ def run_agent(
                     tools=TOOLS,
                     messages=messages,
                 )
+                _log_claude("claude-sonnet-4-6", response)
                 break
             except RateLimitError:
                 wait = 60 * (attempt + 1)
@@ -538,6 +554,7 @@ def run_agent(
                             tools=TOOLS,
                             messages=messages,
                         )
+                        _log_claude("claude-sonnet-4-6", response)
                         break
                     except RateLimitError:
                         wait = 60 * (fb_attempt + 1)
@@ -642,6 +659,7 @@ def run_lite_agent(user_message: str, conversation_history: list) -> tuple[str, 
             tools=_LITE_TOOLS,
             messages=messages,
         )
+        _log_claude("claude-haiku-4-5 (chat)", response)
         messages.append({"role": "assistant", "content": response.content})
 
         if response.stop_reason == "end_turn":
@@ -666,19 +684,67 @@ def run_lite_agent(user_message: str, conversation_history: list) -> tuple[str, 
     return "Couldn't complete that request.", messages, []
 
 
+# ── Bet report generator ───────────────────────────────────────────────────────
+
+def generate_bet_report(bet: dict, score: str) -> str:
+    """
+    Generate a post-game analysis report for a resolved bet using Haiku.
+    Single API call, no tools — cheap and fast.
+    """
+    outcome = bet.get("status", "unknown").upper()
+    pnl     = bet.get("pnl", 0)
+    pnl_str = f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
+
+    prompt = f"""You are a sharp NBA betting analyst. Analyse this resolved bet and write a concise post-game report.
+
+**Bet:** {bet['pick']} ({bet['bet_type'].title()}) @ {bet['odds']:+d}
+**Matchup:** {bet['matchup']} — {bet['game_date']}
+**Stake:** ${bet['stake']:.2f} | **Edge:** {bet['edge']}% | **Confidence:** {bet['confidence']}
+**Final Score:** {score}
+**Outcome:** {outcome} ({pnl_str})
+**Original reasoning:** {bet.get('reasoning', 'N/A')}
+
+Write a 3-section report in plain text (no markdown headers, use bold labels):
+
+**What happened:** Briefly explain the game result vs what was expected.
+**Why it {'won' if outcome == 'WON' else 'lost'}:** Key factors that determined the outcome. If lost, what information was missing or misjudged.
+**Lesson:** One concrete thing the model should do differently or keep doing for future bets of this type."""
+
+    response = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=600,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    _log_claude("claude-haiku-4-5 (bet report)", response)
+    return response.content[0].text.strip()
+
+
 # ── Pre-fetch agent (Sonnet, write-tools only, data passed in context) ─────────
 
 PREFETCH_SYSTEM = """You are BetIQ, an elite NBA sports betting analyst and autonomous paper trader.
 
 All game data has been pre-fetched and is provided in the user message. Do NOT call any data tools — everything you need is already there.
 
+## ⚠️ CRITICAL — Anti-hallucination rules (NEVER violate these)
+- Your training data about NBA rosters, trades, and player status is OUTDATED. Do NOT rely on it.
+- **Only reference players that appear in the roster or injury report data provided to you.**
+- If a player is not in the provided roster list, they are NOT on that team — do not mention them.
+- Never invent statistics or outcomes not present in the data. If data is missing, say so.
+- Every claim must trace back to a specific number or fact in the provided data.
+
 ## Your task
 1. Analyze the provided data: stats, form, splits, rest, injuries, H2H, odds, public %, line movement, book discrepancies
 2. Estimate your win probability for the most promising bet type (ML, spread, or total)
 3. Calculate edge = your_prob − implied_prob
-4. If edge ≥ 5%: call `get_bankroll`, then `place_paper_bet`
-5. If edge < 5% or confidence too low: call `log_candidate_bet`
+4. Call `get_bankroll` to check available slots
+5. Call `submit_analysis` with your honest edge number — **the system decides automatically whether to bet or log**
 6. Call `save_note` to record any pattern or lesson
+
+## ⚠️ KEY RULE — Report your honest edge, nothing else
+- You do NOT decide whether to place a bet. The system does that automatically based on your edge number.
+- If your model says 7% edge, report 7%. If it says 2%, report 2%.
+- Do NOT inflate or deflate your edge to influence whether a bet gets placed.
+- Do NOT skip calling `submit_analysis` — always call it once per game.
 
 ## Implied probability from American odds
 - Positive odds (+X): implied = 100 / (X + 100)
@@ -701,45 +767,42 @@ All game data has been pre-fetched and is provided in the user message. Do NOT c
 - Always call `get_bankroll` immediately before `place_paper_bet`
 
 ## Bet swapping
-If all 5 slots are full but new edge is 3%+ higher than the weakest open bet:
+If all 5 slots are full but your edge is 3%+ higher than the weakest open bet:
 1. Call `cancel_bet` on the weakest bet — note the returned `cancelled_bet_id`
-2. Call `place_paper_bet` with `replaces_bet_id` set
+2. Call `submit_analysis` with `replaces_bet_id` set to the cancelled bet id
 
-## Output format
+## Output format — BE CONCISE. Maximum 150 words total. No tables, no bullet walls.
 ```
 MATCHUP: [Team A vs Team B]
-MY EDGE: [Your prob X% vs implied Y% = Z% edge]
-PICK: [e.g. "Boston Celtics ML"]
-CONFIDENCE: [High / Medium / Low]
-STAKE: [$X of $Y bankroll]
-REASONING: [2-3 sentences on decisive data points]
-PAST PERFORMANCE NOTE: [Relevant pattern from bet history, or "No history yet"]
+EDGE: [X% — your prob vs implied]
+REASONING: [2-3 sentences max on the decisive factors only]
 ```
+Do NOT write long essays. Calculate edge, call get_bankroll, call submit_analysis, call save_note. Done.
 """
 
 PREFETCH_TOOLS = [
     {
         "name": "get_bankroll",
-        "description": "Current balance, open bets, and available slots. Call immediately before place_paper_bet.",
+        "description": "Current balance, open bets, and available slots. Call immediately before submit_analysis.",
         "input_schema": {"type": "object", "properties": {}, "required": []},
     },
     {
-        "name": "place_paper_bet",
-        "description": "Log a paper bet. MUST call get_bankroll first.",
+        "name": "submit_analysis",
+        "description": "Submit your analysis for this game. Always call this once per game after get_bankroll. The system automatically places a bet if edge >= 5% and slots are available — you do NOT decide whether to bet. Just report your honest edge calculation.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "matchup":         {"type": "string"},
-                "pick":            {"type": "string"},
-                "bet_type":        {"type": "string", "enum": ["moneyline", "spread", "total"]},
-                "odds":            {"type": "integer"},
-                "confidence":      {"type": "string", "enum": ["High", "Medium"]},
-                "edge":            {"type": "number"},
-                "reasoning":       {"type": "string"},
-                "game_date":       {"type": "string"},
+                "matchup":     {"type": "string"},
+                "pick":        {"type": "string"},
+                "bet_type":    {"type": "string", "enum": ["moneyline", "spread", "total"]},
+                "odds":        {"type": "integer"},
+                "edge_pct":    {"type": "number", "description": "Your calculated edge as a percentage (e.g. 7.5 for 7.5%)"},
+                "confidence":  {"type": "string", "enum": ["High", "Medium", "Low"]},
+                "reasoning":   {"type": "string"},
+                "game_date":   {"type": "string"},
                 "replaces_bet_id": {"type": "integer"},
             },
-            "required": ["matchup", "pick", "bet_type", "odds", "confidence", "edge", "reasoning"],
+            "required": ["matchup", "pick", "bet_type", "odds", "edge_pct", "confidence", "reasoning"],
         },
     },
     {
@@ -752,28 +815,6 @@ PREFETCH_TOOLS = [
                 "reason": {"type": "string"},
             },
             "required": ["bet_id", "reason"],
-        },
-    },
-    {
-        "name": "log_candidate_bet",
-        "description": "Log a near-miss bet that was analysed but not placed.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "matchup":     {"type": "string"},
-                "pick":        {"type": "string"},
-                "bet_type":    {"type": "string", "enum": ["moneyline", "spread", "total"]},
-                "odds":        {"type": "integer"},
-                "edge_pct":    {"type": "number"},
-                "confidence":  {"type": "string", "enum": ["High", "Medium", "Low"]},
-                "skip_reason": {
-                    "type": "string",
-                    "enum": ["edge_below_threshold", "slots_full", "sharp_money_opposing",
-                             "injury_uncertainty", "line_moved_against", "low_confidence", "other"],
-                },
-                "reasoning":   {"type": "string"},
-            },
-            "required": ["matchup", "pick", "bet_type", "odds", "edge_pct", "confidence", "skip_reason"],
         },
     },
     {
@@ -794,12 +835,46 @@ PREFETCH_TOOLS = [
     },
 ]
 
+def _dispatch_submit_analysis(a: dict) -> dict:
+    """
+    Enforce the betting rule in code — the agent has no say.
+    Edge >= 5% and slots available → place the bet.
+    Edge < 5% or no slots → log as candidate.
+    """
+    edge = float(a.get("edge_pct", 0))
+    bankroll = t.get_bankroll()
+    open_count = len(bankroll.get("open_bets", []))
+
+    if edge >= 5.0 and open_count < 5:
+        return t.place_paper_bet(
+            matchup=a["matchup"],
+            pick=a["pick"],
+            bet_type=a["bet_type"],
+            odds=a["odds"],
+            confidence=a.get("confidence", "Medium") if a.get("confidence") != "Low" else "Medium",
+            edge=edge,
+            reasoning=a.get("reasoning", ""),
+            game_date=a.get("game_date", ""),
+            replaces_bet_id=a.get("replaces_bet_id"),
+        )
+    else:
+        skip_reason = "slots_full" if open_count >= 5 else "edge_below_threshold"
+        return t.log_candidate_bet(
+            matchup=a["matchup"],
+            pick=a["pick"],
+            bet_type=a["bet_type"],
+            odds=a["odds"],
+            edge_pct=edge,
+            confidence=a.get("confidence", "Low"),
+            skip_reason=skip_reason,
+            reasoning=a.get("reasoning", ""),
+        )
+
 _PREFETCH_DISPATCH = {
-    "get_bankroll":       lambda a: t.get_bankroll(),
-    "place_paper_bet":    lambda a: t.place_paper_bet(**a),
-    "cancel_bet":         lambda a: t.cancel_bet(**a),
-    "log_candidate_bet":  lambda a: t.log_candidate_bet(**a),
-    "save_note":          lambda a: t.save_note(**a),
+    "get_bankroll":    lambda a: t.get_bankroll(),
+    "submit_analysis": _dispatch_submit_analysis,
+    "cancel_bet":      lambda a: t.cancel_bet(**a),
+    "save_note":       lambda a: t.save_note(**a),
 }
 
 
@@ -816,13 +891,13 @@ def run_agent_prefetch(context: str, conversation_history: list) -> tuple[str, l
         for attempt in range(6):
             try:
                 response = client.messages.create(
-                    model="claude-sonnet-4-6",
-                    max_tokens=3000,
-                    thinking={"type": "enabled", "budget_tokens": 2000},
+                    model="claude-haiku-4-5-20251001",
+                    max_tokens=2500,
                     system=[{"type": "text", "text": PREFETCH_SYSTEM, "cache_control": {"type": "ephemeral"}}],
                     tools=PREFETCH_TOOLS,
                     messages=messages,
                 )
+                _log_claude("claude-haiku-4-5 (prefetch)", response)
                 break
             except RateLimitError:
                 wait = 60 * (attempt + 1)
@@ -839,7 +914,7 @@ def run_agent_prefetch(context: str, conversation_history: list) -> tuple[str, l
         history_content = [b for b in response.content if b.type != "thinking"]
         messages.append({"role": "assistant", "content": history_content})
 
-        if response.stop_reason == "end_turn":
+        if response.stop_reason in ("end_turn", "max_tokens"):
             text_parts = [b.text for b in response.content if getattr(b, "type", None) == "text"]
             return "\n".join(text_parts).strip() or "Analysis complete.", messages, all_thinking
 

@@ -3,13 +3,28 @@ BetIQ — All tool implementations.
 Covers: Balldontlie API, The Odds API, SQLite bet management.
 """
 
+import logging
 import os
 import re
 import time
 import requests
+
+log = logging.getLogger("betiq.tools")
 from datetime import datetime, date
 from typing import Optional
 from functools import lru_cache
+
+try:
+    from nba_api.stats.static import teams as _nba_static_teams
+    from nba_api.stats.endpoints import (
+        CommonTeamRoster,
+        TeamGameLog,
+        LeagueDashTeamStats,
+        TeamDashboardByGeneralSplits,
+    )
+    _NBA_API_AVAILABLE = True
+except ImportError:
+    _NBA_API_AVAILABLE = False
 
 import database as db
 import data_loader as dl
@@ -85,8 +100,10 @@ def _bdl_get(endpoint: str, params: dict = None) -> dict:
         if r.status_code == 401:
             return {"error": "Balldontlie API key required. Add BALLDONTLIE_API_KEY to .env"}
         r.raise_for_status()
+        db.log_api_call("BallDontLie", endpoint)
         return r.json()
     except requests.HTTPError as e:
+        db.log_api_call("BallDontLie", endpoint)
         return {"error": f"HTTP {r.status_code}: {r.text[:300]}"}
     except Exception as e:
         return {"error": str(e)}
@@ -96,12 +113,20 @@ def _odds_get(endpoint: str, params: dict = None) -> dict | list:
     if not ODDS_API_KEY:
         return {"error": "ODDS_API_KEY not set in .env"}
     p = dict(params or {})
+    cache_key = f"odds_{endpoint}_{sorted((k, v) for k, v in p.items())}"
+    if cached := _cached(cache_key):
+        db.log_api_call("Odds API", endpoint, cached=True)
+        return cached
     p["apiKey"] = ODDS_API_KEY
     try:
         r = requests.get(f"{ODDS_BASE}{endpoint}", params=p, timeout=15)
         r.raise_for_status()
-        return r.json()
+        result = r.json()
+        _cache[cache_key] = (result, time.time())
+        db.log_api_call("Odds API", endpoint, cached=False)
+        return result
     except requests.HTTPError as e:
+        db.log_api_call("Odds API", endpoint, cached=False)
         return {"error": f"Odds API HTTP {r.status_code}: {r.text[:300]}"}
     except Exception as e:
         return {"error": str(e)}
@@ -109,12 +134,16 @@ def _odds_get(endpoint: str, params: dict = None) -> dict | list:
 
 # ── Team resolution ───────────────────────────────────────────────────────────
 
-@lru_cache(maxsize=None)
+_teams_cache: dict = {}
+
 def _get_all_teams() -> dict:
+    global _teams_cache
+    if _teams_cache:
+        return _teams_cache
     data = _bdl_get("/teams", {"per_page": 100})
-    if "error" in data:
-        return {}
-    cache: dict = {}
+    if "error" in data or not data.get("data"):
+        return {}  # Don't cache failures — retry next call
+    result: dict = {}
     for team in data.get("data", []):
         for key in (
             team["full_name"].lower(),
@@ -122,8 +151,9 @@ def _get_all_teams() -> dict:
             team["abbreviation"].lower(),
             team["city"].lower(),
         ):
-            cache[key] = team
-    return cache
+            result[key] = team
+    _teams_cache = result
+    return _teams_cache
 
 
 def _resolve_team(name: str) -> Optional[dict]:
@@ -137,6 +167,31 @@ def _resolve_team(name: str) -> Optional[dict]:
     return None
 
 
+_NBA_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Referer": "https://www.nba.com/",
+    "Origin": "https://www.nba.com",
+    "x-nba-stats-origin": "stats",
+    "x-nba-stats-token": "true",
+}
+_nba_id_cache: dict = {}
+
+def _nba_team_id(team_name: str) -> Optional[int]:
+    if not _NBA_API_AVAILABLE:
+        return None
+    if team_name in _nba_id_cache:
+        return _nba_id_cache[team_name]
+    nl = team_name.lower().strip()
+    for t in _nba_static_teams.get_teams():
+        if nl == t["full_name"].lower() or nl in t["full_name"].lower() or t["nickname"].lower() in nl:
+            _nba_id_cache[team_name] = t["id"]
+            return t["id"]
+    return None
+
+def _nba_season_str() -> str:
+    s = _current_season()
+    return f"{s}-{str(s + 1)[-2:]}"
+
 def _current_season() -> int:
     now = datetime.now()
     return now.year if now.month >= 10 else now.year - 1
@@ -145,78 +200,115 @@ def _current_season() -> int:
 # ── Tool implementations ──────────────────────────────────────────────────────
 
 def get_todays_games() -> dict:
-    today = date.today().isoformat()
-    cache_key = f"today_games_{today}"
+    """
+    Fetch today's NBA games. Queries both today AND tomorrow from BallDontLie
+    because late games (9:30 PM EST+) tip off after midnight UTC and get classified
+    as the next day in BDL. All games are normalized to today's EST date.
+    """
+    from datetime import timedelta
+    today     = date.today()
+    tomorrow  = today + timedelta(days=1)
+    today_str = today.isoformat()
+    cache_key = f"today_games_{today_str}"
     if cached := _cached(cache_key):
         return cached
 
-    data = _bdl_get("/games", {"dates[]": today, "per_page": 100})
-    if "error" in data:
-        return data
-
+    seen_ids = set()
     games = []
-    for g in data.get("data", []):
-        games.append({
-            "id":               g["id"],
-            "date":             g.get("date", today)[:10],
-            "home_team":        g["home_team"]["full_name"],
-            "visitor_team":     g["visitor_team"]["full_name"],
-            "home_team_score":  g.get("home_team_score", 0),
-            "visitor_team_score": g.get("visitor_team_score", 0),
-            "status":           g.get("status", "scheduled"),
-            "time":             g.get("time", ""),
-        })
 
-    result = {"games": games, "count": len(games), "date": today}
+    for query_date in (today_str, tomorrow.isoformat()):
+        data = _bdl_get("/games", {"dates[]": query_date, "per_page": 100})
+        if "error" in data:
+            continue
+        for g in data.get("data", []):
+            if g["id"] in seen_ids:
+                continue
+            if query_date == tomorrow.isoformat():
+                status = g.get("status", "")
+                # Only include tomorrow-date games that are already in progress/Final
+                # (those are tonight's late games that crossed midnight UTC),
+                # OR games that tip off before 06:00 UTC (= before 2 AM EST = tonight).
+                # Skip daytime games on tomorrow's date — they are genuinely tomorrow.
+                is_started = status in ("Final", "In Progress") or (status and not status[0].isdigit())
+                is_late_tonight = status and status[0].isdigit() and status[11:16] < "06:00"
+                if not is_started and not is_late_tonight:
+                    continue
+            seen_ids.add(g["id"])
+            games.append({
+                "id":                 g["id"],
+                "date":               today_str,  # normalize all to EST today
+                "bdl_date":           g.get("date", today_str)[:10],  # keep original for resolution
+                "home_team":          g["home_team"]["full_name"],
+                "visitor_team":       g["visitor_team"]["full_name"],
+                "home_team_score":    g.get("home_team_score", 0),
+                "visitor_team_score": g.get("visitor_team_score", 0),
+                "status":             g.get("status", "scheduled"),
+                "time":               g.get("time", ""),
+            })
+
+    result = {"games": games, "count": len(games), "date": today_str}
     _set_cache(cache_key, result)
     return result
 
 
 def get_team_stats(team_name: str, season: int = None) -> dict:
     season = season or _current_season()
-
-    # Use local Kaggle data for seasons in the dataset
     local = dl.get_team_stats_local(team_name, season)
     if local is not None:
         return local
 
-    # Fall back to Balldontlie API for current/recent seasons
-    team = _resolve_team(team_name)
-    if not team:
-        return {"error": f"Team not found: {team_name}"}
-
-    cache_key = f"team_stats_{team['id']}_{season}"
+    cache_key = f"team_stats_{team_name}_{season}"
     if cached := _cached(cache_key):
         return cached
 
-    avg_data   = _bdl_get("/season_averages", {"season": season, "team_ids[]": team["id"]})
-    games_data = _bdl_get("/games", {
-        "seasons[]":  season,
-        "team_ids[]": team["id"],
-        "per_page":   100,
-    })
+    if _NBA_API_AVAILABLE:
+        team_id = _nba_team_id(team_name)
+        if team_id:
+            try:
+                season_str = f"{season}-{str(season + 1)[-2:]}"
+                time.sleep(0.6)
+                ep = LeagueDashTeamStats(season=season_str, timeout=15, headers=_NBA_HEADERS)
+                df = ep.league_dash_team_stats.get_data_frame()
+                nl = team_name.lower()
+                match = df[df["TEAM_NAME"].str.lower().str.contains(nl.split()[-1], na=False)]
+                if match.empty:
+                    return {"error": f"Team not found: {team_name}"}
+                row = match.iloc[0]
+                result = {
+                    "team": row["TEAM_NAME"], "season": season, "source": "nba_api",
+                    "record": {"wins": int(row["W"]), "losses": int(row["L"]), "win_pct": round(float(row["W_PCT"]), 3)},
+                    "averages": {
+                        "pts": round(float(row["PTS"]), 1), "reb": round(float(row["REB"]), 1),
+                        "ast": round(float(row["AST"]), 1), "stl": round(float(row["STL"]), 1),
+                        "blk": round(float(row["BLK"]), 1), "tov": round(float(row["TOV"]), 1),
+                        "fg_pct": round(float(row["FG_PCT"]), 3), "fg3_pct": round(float(row["FG3_PCT"]), 3),
+                    },
+                }
+                _set_cache(cache_key, result)
+                return result
+            except Exception:
+                pass
 
+    # BDL fallback
+    team = _resolve_team(team_name)
+    if not team:
+        return {"error": f"Team not found: {team_name}"}
+    avg_data = _bdl_get("/season_averages", {"season": season, "team_ids[]": team["id"]})
+    games_data = _bdl_get("/games", {"seasons[]": season, "team_ids[]": team["id"], "per_page": 100})
     wins = losses = 0
     if "data" in games_data:
         for g in games_data["data"]:
             if g.get("status") != "Final":
                 continue
             if g["home_team"]["id"] == team["id"]:
-                if g["home_team_score"] > g["visitor_team_score"]:
-                    wins += 1
-                else:
-                    losses += 1
+                if g["home_team_score"] > g["visitor_team_score"]: wins += 1
+                else: losses += 1
             else:
-                if g["visitor_team_score"] > g["home_team_score"]:
-                    wins += 1
-                else:
-                    losses += 1
-
+                if g["visitor_team_score"] > g["home_team_score"]: wins += 1
+                else: losses += 1
     result = {
-        "team":     team["full_name"],
-        "season":   season,
-        "source":   "balldontlie_api",
-        "record":   {"wins": wins, "losses": losses, "win_pct": round(wins / max(wins + losses, 1), 3)},
+        "team": team["full_name"], "season": season, "source": "bdl",
+        "record": {"wins": wins, "losses": losses, "win_pct": round(wins/max(wins+losses,1), 3)},
         "averages": avg_data.get("data", []),
     }
     _set_cache(cache_key, result)
@@ -241,22 +333,53 @@ def get_season_stats(team_name: str, seasons: list = None) -> dict:
 
 
 def get_recent_form(team_name: str, last_n: int = 10) -> dict:
-    team = _resolve_team(team_name)
-    if not team:
-        return {"error": f"Team not found: {team_name}"}
-
-    cache_key = f"form_{team['id']}_{last_n}"
+    cache_key = f"form_{team_name}_{last_n}"
     if cached := _cached(cache_key):
         return cached
 
-    # Current season via API (most recent games)
-    season = _current_season()
-    data = _bdl_get("/games", {
-        "seasons[]":  season,
-        "team_ids[]": team["id"],
-        "per_page":   100,
-    })
+    if _NBA_API_AVAILABLE:
+        team_id = _nba_team_id(team_name)
+        if team_id:
+            try:
+                time.sleep(0.6)
+                ep = TeamGameLog(team_id=team_id, season=_nba_season_str(), timeout=15, headers=_NBA_HEADERS)
+                df = ep.team_game_log.get_data_frame().head(last_n)
+                form = []
+                for _, row in df.iterrows():
+                    matchup = str(row.get("MATCHUP", ""))
+                    home = " vs. " in matchup
+                    opponent = matchup.split(" vs. ")[-1] if home else matchup.split(" @ ")[-1]
+                    pts_for = int(row.get("PTS", 0))
+                    margin = int(row.get("PLUS_MINUS", 0))
+                    pts_against = pts_for - margin
+                    form.append({
+                        "date": str(row.get("GAME_DATE", ""))[:10],
+                        "opponent": opponent,
+                        "location": "Home" if home else "Away",
+                        "score": f"{pts_for}-{pts_against}",
+                        "result": str(row.get("WL", "")),
+                        "margin": margin,
+                        "source": "nba_api",
+                    })
+                wins = sum(1 for g in form if g["result"] == "W")
+                result = {
+                    "team": team_name, "games_back": len(form),
+                    "record": f"{wins}-{len(form) - wins}",
+                    "win_pct": round(wins / max(len(form), 1), 3),
+                    "avg_margin": round(sum(g["margin"] for g in form) / max(len(form), 1), 1),
+                    "form": form,
+                }
+                _set_cache(cache_key, result)
+                return result
+            except Exception:
+                pass
 
+    # BDL fallback
+    team = _resolve_team(team_name)
+    if not team:
+        return {"error": f"Team not found: {team_name}"}
+    season = _current_season()
+    data = _bdl_get("/games", {"seasons[]": season, "team_ids[]": team["id"], "per_page": 100})
     form = []
     if "error" not in data:
         finished = [g for g in data.get("data", []) if g.get("status") == "Final"]
@@ -268,32 +391,25 @@ def get_recent_form(team_name: str, last_n: int = 10) -> dict:
             opponent    = g["visitor_team"]["full_name"] if home else g["home_team"]["full_name"]
             won         = pts_for > pts_against
             form.append({
-                "date":     g.get("date", "")[:10],
-                "opponent": opponent,
+                "date": g.get("date", "")[:10], "opponent": opponent,
                 "location": "Home" if home else "Away",
-                "score":    f"{pts_for}-{pts_against}",
-                "result":   "W" if won else "L",
-                "margin":   pts_for - pts_against,
-                "source":   "api",
+                "score": f"{pts_for}-{pts_against}",
+                "result": "W" if won else "L", "margin": pts_for - pts_against, "source": "bdl",
             })
-
-    # If API returned fewer than last_n, backfill from the Kaggle dataset
     if len(form) < last_n:
-        needed  = last_n - len(form)
-        local   = dl.get_recent_form_local(team_name, dl.KAGGLE_MAX_SEASON, needed)
+        needed = last_n - len(form)
+        local = dl.get_recent_form_local(team_name, dl.KAGGLE_MAX_SEASON, needed)
         if local:
             for g in local["form"]:
                 g["source"] = "local_kaggle"
             form.extend(local["form"])
-
     wins = sum(1 for g in form if g["result"] == "W")
     result = {
-        "team":       team["full_name"],
-        "games_back": len(form),
-        "record":     f"{wins}-{len(form) - wins}",
-        "win_pct":    round(wins / max(len(form), 1), 3),
+        "team": team["full_name"], "games_back": len(form),
+        "record": f"{wins}-{len(form) - wins}",
+        "win_pct": round(wins / max(len(form), 1), 3),
         "avg_margin": round(sum(g["margin"] for g in form) / max(len(form), 1), 1),
-        "form":       form,
+        "form": form,
     }
     _set_cache(cache_key, result)
     return result
@@ -301,32 +417,51 @@ def get_recent_form(team_name: str, last_n: int = 10) -> dict:
 
 def get_home_away_splits(team_name: str, season: int = None) -> dict:
     season = season or _current_season()
-
-    # Use local data when available
     local = dl.get_home_away_splits_local(team_name, season)
     if local is not None:
         return local
 
-    # Fall back to API for current/recent seasons
-    team = _resolve_team(team_name)
-    if not team:
-        return {"error": f"Team not found: {team_name}"}
-
-    cache_key = f"splits_{team['id']}_{season}"
+    season_str = f"{season}-{str(season + 1)[-2:]}"
+    cache_key = f"splits_{team_name}_{season}"
     if cached := _cached(cache_key):
         return cached
 
-    data = _bdl_get("/games", {
-        "seasons[]":  season,
-        "team_ids[]": team["id"],
-        "per_page":   100,
-    })
+    if _NBA_API_AVAILABLE:
+        team_id = _nba_team_id(team_name)
+        if team_id:
+            try:
+                time.sleep(0.6)
+                ep = TeamDashboardByGeneralSplits(team_id=team_id, season=season_str, timeout=15, headers=_NBA_HEADERS)
+                loc_df = ep.location_team_dashboard.get_data_frame()
+                def _split(label):
+                    rows = loc_df[loc_df["GROUP_VALUE"] == label]
+                    if rows.empty:
+                        return {"record": "0-0", "win_pct": 0, "avg_pts_for": 0, "avg_pts_against": 0, "avg_margin": 0}
+                    r = rows.iloc[0]
+                    pts = float(r["PTS"]); pm = float(r["PLUS_MINUS"])
+                    return {
+                        "record": f"{int(r['W'])}-{int(r['L'])}",
+                        "win_pct": round(float(r["W_PCT"]), 3),
+                        "avg_pts_for": round(pts, 1),
+                        "avg_pts_against": round(pts - pm, 1),
+                        "avg_margin": round(pm, 1),
+                    }
+                result = {"team": team_name, "season": season, "source": "nba_api",
+                          "home": _split("Home"), "away": _split("Road")}
+                _set_cache(cache_key, result)
+                return result
+            except Exception:
+                pass
+
+    # BDL fallback
+    team = _resolve_team(team_name)
+    if not team:
+        return {"error": f"Team not found: {team_name}"}
+    data = _bdl_get("/games", {"seasons[]": season, "team_ids[]": team["id"], "per_page": 100})
     if "error" in data:
         return data
-
     hw = hl = aw = al = 0
     hpf = hpa = apf = apa = 0
-
     for g in data.get("data", []):
         if g.get("status") != "Final":
             continue
@@ -334,92 +469,97 @@ def get_home_away_splits(team_name: str, season: int = None) -> dict:
             pf, pa = g["home_team_score"], g["visitor_team_score"]
             hpf += pf; hpa += pa
             if pf > pa: hw += 1
-            else:       hl += 1
+            else: hl += 1
         else:
             pf, pa = g["visitor_team_score"], g["home_team_score"]
             apf += pf; apa += pa
             if pf > pa: aw += 1
-            else:       al += 1
-
-    hg = hw + hl
-    ag = aw + al
-
+            else: al += 1
+    hg = hw + hl; ag = aw + al
     result = {
-        "team":   team["full_name"],
-        "season": season,
-        "source": "balldontlie_api",
-        "home": {
-            "record":          f"{hw}-{hl}",
-            "win_pct":         round(hw / max(hg, 1), 3),
-            "avg_pts_for":     round(hpf / max(hg, 1), 1),
-            "avg_pts_against": round(hpa / max(hg, 1), 1),
-            "avg_margin":      round((hpf - hpa) / max(hg, 1), 1),
-        },
-        "away": {
-            "record":          f"{aw}-{al}",
-            "win_pct":         round(aw / max(ag, 1), 3),
-            "avg_pts_for":     round(apf / max(ag, 1), 1),
-            "avg_pts_against": round(apa / max(ag, 1), 1),
-            "avg_margin":      round((apf - apa) / max(ag, 1), 1),
-        },
+        "team": team["full_name"], "season": season, "source": "bdl",
+        "home": {"record": f"{hw}-{hl}", "win_pct": round(hw/max(hg,1),3), "avg_pts_for": round(hpf/max(hg,1),1), "avg_pts_against": round(hpa/max(hg,1),1), "avg_margin": round((hpf-hpa)/max(hg,1),1)},
+        "away": {"record": f"{aw}-{al}", "win_pct": round(aw/max(ag,1),3), "avg_pts_for": round(apf/max(ag,1),1), "avg_pts_against": round(apa/max(ag,1),1), "avg_margin": round((apf-apa)/max(ag,1),1)},
     }
     _set_cache(cache_key, result)
     return result
 
 
 def get_rest_days(team_name: str) -> dict:
+    today = date.today()
+    cache_key = f"rest_days_{team_name}_{today}"
+    if cached := _cached(cache_key):
+        return cached
+
+    if _NBA_API_AVAILABLE:
+        team_id = _nba_team_id(team_name)
+        if team_id:
+            try:
+                time.sleep(0.6)
+                ep = TeamGameLog(team_id=team_id, season=_nba_season_str(), timeout=15, headers=_NBA_HEADERS)
+                df = ep.team_game_log.get_data_frame()
+                last_game_date = None
+                last_matchup = ""
+                for _, row in df.iterrows():
+                    try:
+                        from datetime import datetime as _dt
+                        gd = _dt.strptime(str(row.get("GAME_DATE", "")), "%b %d, %Y").date()
+                        if gd < today:
+                            last_game_date = gd
+                            last_matchup = str(row.get("MATCHUP", ""))
+                            break
+                    except Exception:
+                        continue
+                result: dict = {"team": team_name}
+                if last_game_date:
+                    rest = (today - last_game_date).days
+                    result.update({
+                        "last_game_date": last_game_date.isoformat(),
+                        "last_game_matchup": last_matchup,
+                        "days_rest": rest,
+                        "fatigue_level": "High" if rest <= 1 else ("Medium" if rest <= 2 else "Low"),
+                        "source": "nba_api",
+                    })
+                else:
+                    result.update({"days_rest": None, "fatigue_level": "Unknown"})
+                _set_cache(cache_key, result)
+                return result
+            except Exception:
+                pass
+
+    # BDL fallback
     team = _resolve_team(team_name)
     if not team:
         return {"error": f"Team not found: {team_name}"}
-
-    today = date.today()
     season = _current_season()
-    data = _bdl_get("/games", {
-        "seasons[]": season,
-        "team_ids[]": team["id"],
-        "per_page": 100,
-    })
+    data = _bdl_get("/games", {"seasons[]": season, "team_ids[]": team["id"], "per_page": 100})
     if "error" in data:
         return data
-
     games = [g for g in data.get("data", []) if g.get("date")]
     games.sort(key=lambda g: g["date"], reverse=True)
-
-    last_game = next(
-        (g for g in games if g.get("status") == "Final" and date.fromisoformat(g["date"][:10]) < today),
-        None,
-    )
-    next_game = next(
-        (g for g in reversed(games) if date.fromisoformat(g["date"][:10]) >= today),
-        None,
-    )
-
-    result: dict = {"team": team["full_name"]}
+    last_game = next((g for g in games if g.get("status") == "Final" and date.fromisoformat(g["date"][:10]) < today), None)
+    next_game = next((g for g in reversed(games) if date.fromisoformat(g["date"][:10]) >= today), None)
+    result = {"team": team["full_name"]}
     if last_game:
         last_date = date.fromisoformat(last_game["date"][:10])
         rest = (today - last_date).days
-        result.update({
-            "last_game_date": last_game["date"][:10],
-            "days_rest": rest,
-            "fatigue_level": "High" if rest <= 1 else ("Medium" if rest <= 2 else "Low"),
-        })
+        result.update({"last_game_date": last_game["date"][:10], "days_rest": rest, "fatigue_level": "High" if rest <= 1 else ("Medium" if rest <= 2 else "Low")})
     else:
         result.update({"days_rest": None, "fatigue_level": "Unknown"})
-
     if next_game:
-        opp = (next_game["visitor_team"]["full_name"]
-               if next_game["home_team"]["id"] == team["id"]
-               else next_game["home_team"]["full_name"])
-        result.update({
-            "next_game_date": next_game["date"][:10],
-            "next_opponent":  opp,
-            "home_or_away": "Home" if next_game["home_team"]["id"] == team["id"] else "Away",
-        })
+        opp = (next_game["visitor_team"]["full_name"] if next_game["home_team"]["id"] == team["id"] else next_game["home_team"]["full_name"])
+        result.update({"next_game_date": next_game["date"][:10], "next_opponent": opp, "home_or_away": "Home" if next_game["home_team"]["id"] == team["id"] else "Away"})
+    _set_cache(cache_key, result)
     return result
 
 
 def get_injury_report(team_name: str) -> dict:
     """Fetch live injury report from ESPN's free API."""
+    today = date.today().isoformat()
+    cache_key = f"injuries_{team_name}_{today}"
+    if cached := _cached(cache_key):
+        return cached
+
     try:
         r = requests.get(
             "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/injuries",
@@ -427,6 +567,7 @@ def get_injury_report(team_name: str) -> dict:
         )
         r.raise_for_status()
         data = r.json()
+        db.log_api_call("ESPN", "/injuries")
     except Exception as e:
         return {"error": f"ESPN injury API failed: {e}"}
 
@@ -453,13 +594,15 @@ def get_injury_report(team_name: str) -> dict:
             })
         break  # found the team
 
-    return {
+    result = {
         "team":     team_name,
         "source":   "espn_live",
         "injuries": injuries,
         "count":    len(injuries),
         "note":     "Live data from ESPN." if injuries else "No injuries reported for this team.",
     }
+    _set_cache(cache_key, result)
+    return result
 
 
 def get_head_to_head(team1_name: str, team2_name: str, num_seasons: int = 3) -> dict:
@@ -530,6 +673,128 @@ def get_head_to_head(team1_name: str, team2_name: str, num_seasons: int = 3) -> 
         "avg_total_points": round(avg_total, 1),
         "matchups":         all_matchups[:50],
     }
+
+
+def get_current_roster(team_name: str) -> dict:
+    today = date.today().isoformat()
+    cache_key = f"roster_{team_name}_{today}"
+    if cached := _cached(cache_key):
+        return cached
+
+    if _NBA_API_AVAILABLE:
+        team_id = _nba_team_id(team_name)
+        if team_id:
+            try:
+                time.sleep(0.6)
+                ep = CommonTeamRoster(team_id=team_id, season=_nba_season_str(), timeout=15, headers=_NBA_HEADERS)
+                df = ep.common_team_roster.get_data_frame()
+                players = [
+                    {"name": row["PLAYER"], "position": row["POSITION"], "jersey": str(row["NUM"])}
+                    for _, row in df.iterrows()
+                ]
+                result = {
+                    "team": team_name, "players": players, "count": len(players),
+                    "source": "nba_api",
+                    "note": "These are the ONLY players currently on this roster. Do not reference any player not on this list.",
+                }
+                _set_cache(cache_key, result)
+                return result
+            except Exception:
+                pass
+
+    # BDL fallback
+    team = _resolve_team(team_name)
+    if not team:
+        return {"error": f"Team not found: {team_name}"}
+    data = _bdl_get("/players/active", {"team_ids[]": team["id"], "per_page": 100})
+    if "error" in data:
+        return data
+    players = [
+        {"name": f"{p.get('first_name','')} {p.get('last_name','')}".strip(),
+         "position": p.get("position", ""), "jersey": p.get("jersey_number", "")}
+        for p in data.get("data", [])
+    ]
+    result = {
+        "team": team["full_name"], "players": players, "count": len(players), "source": "bdl",
+        "note": "These are the ONLY players currently on this roster. Do not reference any player not on this list.",
+    }
+    _set_cache(cache_key, result)
+    return result
+
+
+def get_advanced_stats(team_name: str) -> dict:
+    """
+    Fetch advanced team metrics from NBA Stats API (free, unofficial).
+    Returns OffRtg, DefRtg, Pace, TS%, AST%, TOV% for the current season.
+    """
+    today = date.today().isoformat()
+    cache_key = f"advanced_stats_{team_name}_{today}"
+    if cached := _cached(cache_key):
+        return cached
+
+    season = _current_season()
+    season_str = f"{season}-{str(season + 1)[-2:]}"
+
+    headers = {
+        "User-Agent":           "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Referer":              "https://www.nba.com/",
+        "Origin":               "https://www.nba.com",
+        "x-nba-stats-origin":  "stats",
+        "x-nba-stats-token":   "true",
+        "Accept":               "application/json",
+    }
+
+    try:
+        r = requests.get(
+            "https://stats.nba.com/stats/leaguedashteamstats",
+            params={
+                "MeasureType":  "Advanced",
+                "PerMode":      "PerGame",
+                "Season":       season_str,
+                "SeasonType":   "Regular Season",
+                "LeagueID":     "00",
+                "LastNGames":   0,
+                "Month":        0,
+                "OpponentTeamID": 0,
+                "PaceAdjust":   "N",
+                "PlusMinus":    "N",
+                "Rank":         "N",
+            },
+            headers=headers,
+            timeout=15,
+        )
+        r.raise_for_status()
+        data = r.json()
+        db.log_api_call("NBA Stats", "/leaguedashteamstats")
+    except Exception as e:
+        return {"available": False, "note": "Advanced metrics not available (server network restriction)", "team": team_name}
+
+    result_set = data.get("resultSets", [{}])[0]
+    headers_list = result_set.get("headers", [])
+    rows = result_set.get("rowSet", [])
+
+    nl = team_name.lower()
+    for row in rows:
+        row_dict = dict(zip(headers_list, row))
+        if nl in row_dict.get("TEAM_NAME", "").lower():
+            result = {
+                "team":     row_dict.get("TEAM_NAME"),
+                "season":   season_str,
+                "off_rtg":  row_dict.get("OFF_RATING"),
+                "def_rtg":  row_dict.get("DEF_RATING"),
+                "net_rtg":  row_dict.get("NET_RATING"),
+                "pace":     row_dict.get("PACE"),
+                "ts_pct":   row_dict.get("TS_PCT"),
+                "ast_pct":  row_dict.get("AST_PCT"),
+                "tov_pct":  row_dict.get("TM_TOV_PCT"),
+                "oreb_pct": row_dict.get("OREB_PCT"),
+                "dreb_pct": row_dict.get("DREB_PCT"),
+                "source":   "nba_stats_api",
+            }
+            _set_cache(cache_key, result)
+            return result
+
+    return {"available": False, "note": "Advanced metrics not available (server network restriction)", "team": team_name}
 
 
 def get_public_betting_percentages(team_name: str = None) -> dict:
@@ -1007,6 +1272,7 @@ def place_paper_bet(
     reasoning: str,
     game_date: str = None,
     replaces_bet_id: int = None,
+    edge_type: str = None,
 ) -> dict:
     balance    = db.get_balance()
     open_bets  = db.get_open_bets()
@@ -1045,6 +1311,13 @@ def place_paper_bet(
     bet_id = db.insert_bet(bet)
     db.update_balance(balance - stake)
 
+    if edge_type:
+        import sqlite3 as _sqlite3
+        conn = _sqlite3.connect(db.DB_PATH)
+        conn.execute("UPDATE bets SET edge_type=? WHERE id=?", (edge_type, bet_id))
+        conn.commit()
+        conn.close()
+
     if replaces_bet_id:
         db.link_replacement(bet_id, replaces_bet_id)
 
@@ -1077,6 +1350,14 @@ def place_paper_bet(
         title=f"BetIQ Bet Placed",
         message=f"{pick} ({bet_type})\n{matchup}\nOdds: {odds:+d} | Edge: {edge:.1f}% | Confidence: {confidence}\nKelly: {kelly_pct:.1f}% | Stake: ${stake:.2f} | Balance: ${round(balance - stake, 2):.2f}{bf_msg}",
     )
+
+    # Validate player names in reasoning against actual rosters
+    try:
+        parts = matchup.replace(" @ ", " vs ").split(" vs ")
+        if len(parts) == 2:
+            validate_reasoning_players(reasoning, parts[1].strip(), parts[0].strip())
+    except Exception:
+        pass
 
     return {
         "success":            True,
@@ -1183,6 +1464,63 @@ def get_bet_history() -> dict:
             "Evaluate recent win rate vs. long-term win rate. "
             "If recent performance is declining, reduce confidence levels."
         ),
+    }
+
+
+def validate_reasoning_players(reasoning: str, home_team: str, away_team: str) -> dict:
+    """
+    Cross-check player names mentioned in Claude's reasoning against actual rosters.
+    Returns a list of hallucinated players (names mentioned but not on current roster).
+    Called automatically after place_paper_bet or log_candidate_bet.
+    """
+    if not reasoning:
+        return {"hallucinations": [], "checked": False}
+
+    home_roster = get_current_roster(home_team)
+    away_roster = get_current_roster(away_team)
+
+    all_players = set()
+    for roster in (home_roster, away_roster):
+        for p in roster.get("players", []):
+            name = p["name"].lower()
+            parts = name.split()
+            all_players.add(name)
+            if parts:
+                all_players.add(parts[-1])  # last name alone
+                if len(parts) > 1:
+                    all_players.add(parts[0])  # first name alone
+
+    reasoning_lower = reasoning.lower()
+    words = set(reasoning_lower.split())
+
+    # Common NBA last names that appear in reasoning but aren't on either team
+    # We check multi-word names (first + last) not found in roster
+    import re as _re
+    # Extract capitalized word pairs (likely player names)
+    name_pattern = _re.findall(r'\b([A-Z][a-z]+(?:\s[A-Z][a-z]+)+)\b', reasoning)
+    hallucinated = []
+    for name in name_pattern:
+        nl = name.lower()
+        last = nl.split()[-1]
+        # Check if neither the full name nor last name is in any roster
+        if nl not in all_players and last not in all_players:
+            # Filter out common non-player proper nouns
+            skip = {"nba", "golden", "state", "los", "angeles", "san", "new", "york",
+                    "oklahoma", "city", "new", "orleans", "half", "kelly", "monday",
+                    "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"}
+            if last not in skip and len(last) > 3:
+                hallucinated.append(name)
+
+    if hallucinated:
+        warning = f"HALLUCINATION ALERT: Claude mentioned {hallucinated} in reasoning but they are NOT on {home_team} or {away_team} current rosters. Review this bet."
+        db.add_agent_note("hallucination_warning", warning)
+        log.warning(warning)
+
+    return {
+        "hallucinations": hallucinated,
+        "checked": True,
+        "roster_size_home": len(home_roster.get("players", [])),
+        "roster_size_away": len(away_roster.get("players", [])),
     }
 
 
@@ -1421,7 +1759,18 @@ def _finalize_bet(bet: dict, home: str, away: str, home_score: int, away_score: 
             tags="x,chart_with_downwards_trend",
         )
 
+    score_str = f"{home} {home_score} - {away} {away_score}"
     db.resolve_bet(bet["id"], status, pnl)
+
+    # Generate post-game analysis report (Haiku, single call)
+    try:
+        from agent import generate_bet_report
+        resolved_bet = {**bet, "status": status, "pnl": pnl}
+        report = generate_bet_report(resolved_bet, score_str)
+        db.set_bet_report(bet["id"], report)
+    except Exception as exc:
+        log.warning(f"Bet report generation failed for bet {bet['id']}: {exc}")
+
     resolved_list.append({
         "bet_id":    bet["id"],
         "game_date": bet.get("game_date", ""),
@@ -1429,35 +1778,44 @@ def _finalize_bet(bet: dict, home: str, away: str, home_score: int, away_score: 
         "pick":      bet["pick"],
         "status":    status,
         "pnl":       pnl,
-        "score":     f"{home} {home_score} - {away} {away_score}",
+        "score":     score_str,
     })
 
 
 def _resolve_via_balldontlie(bets: list, resolved_list: list):
+    from datetime import timedelta
     today = date.today()
     for bet in bets:
         gd = bet.get("game_date", "")
         if not gd:
             continue
         try:
-            if date.fromisoformat(gd) >= today:
+            # Allow tomorrow's date — late games (9 PM EST) tip off after midnight UTC
+            if date.fromisoformat(gd) > today + timedelta(days=1):
                 continue
         except ValueError:
             continue
 
-        data = _bdl_get("/games", {"dates[]": gd, "per_page": 50})
-        if "error" in data:
-            continue
-
-        for g in data.get("data", []):
-            if g.get("status") != "Final":
+        # Query both the stored game_date AND the next day — late EST games
+        # (9:30 PM+) tip off after midnight UTC and BDL stores them as tomorrow.
+        next_day = (date.fromisoformat(gd) + timedelta(days=1)).isoformat()
+        found = False
+        for query_date in (gd, next_day):
+            data = _bdl_get("/games", {"dates[]": query_date, "per_page": 50})
+            if "error" in data:
                 continue
-            home  = g["home_team"]["full_name"]
-            away  = g["visitor_team"]["full_name"]
-            if not _matchup_matches(bet["matchup"], home, away):
-                continue
-            _finalize_bet(bet, home, away, g["home_team_score"], g["visitor_team_score"], resolved_list)
-            break
+            for g in data.get("data", []):
+                if g.get("status") != "Final":
+                    continue
+                home  = g["home_team"]["full_name"]
+                away  = g["visitor_team"]["full_name"]
+                if not _matchup_matches(bet["matchup"], home, away):
+                    continue
+                _finalize_bet(bet, home, away, g["home_team_score"], g["visitor_team_score"], resolved_list)
+                found = True
+                break
+            if found:
+                break
 
 
 def _evaluate_pick(bet: dict, home: str, away: str, home_score: int, away_score: int) -> Optional[bool]:
@@ -1480,7 +1838,7 @@ def _evaluate_pick(bet: dict, home: str, away: str, home_score: int, away_score:
         if any(w in hl for w in pick.split()):
             return (home_score - away_score) > -spread
         if any(w in al for w in pick.split()):
-            return (away_score - home_score) > spread
+            return (away_score - home_score) > -spread
         return None
 
     if bet_type == "total":
