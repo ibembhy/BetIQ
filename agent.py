@@ -723,7 +723,7 @@ Write a 3-section report in plain text (no markdown headers, use bold labels):
 
 PREFETCH_SYSTEM = """You are BetIQ, an elite NBA sports betting analyst and autonomous paper trader.
 
-All game data has been pre-fetched and is provided in the user message. Do NOT call any data tools — everything you need is already there.
+All game data AND bankroll info has been pre-fetched and is provided in the user message. Do NOT call any data tools — everything you need is already there.
 
 ## ⚠️ CRITICAL — Anti-hallucination rules (NEVER violate these)
 - Your training data about NBA rosters, trades, and player status is OUTDATED. Do NOT rely on it.
@@ -736,15 +736,14 @@ All game data has been pre-fetched and is provided in the user message. Do NOT c
 1. Analyze the provided data: stats, form, splits, rest, injuries, H2H, odds, public %, line movement, book discrepancies
 2. Estimate your win probability for the most promising bet type (ML, spread, or total)
 3. Calculate edge = your_prob − implied_prob
-4. Call `get_bankroll` to check available slots
-5. Call `submit_analysis` with your honest edge number — **the system decides automatically whether to bet or log**
-6. Call `save_note` to record any pattern or lesson
+4. Call `submit_analysis` AND `save_note` together in the same response — **the system decides automatically whether to bet or log**
 
 ## ⚠️ KEY RULE — Report your honest edge, nothing else
 - You do NOT decide whether to place a bet. The system does that automatically based on your edge number.
 - If your model says 7% edge, report 7%. If it says 2%, report 2%.
 - Do NOT inflate or deflate your edge to influence whether a bet gets placed.
 - Do NOT skip calling `submit_analysis` — always call it once per game.
+- The bankroll and open bet count are already in the context — do NOT call get_bankroll.
 
 ## Implied probability from American odds
 - Positive odds (+X): implied = 100 / (X + 100)
@@ -781,11 +780,6 @@ Do NOT write long essays. Calculate edge, call get_bankroll, call submit_analysi
 """
 
 PREFETCH_TOOLS = [
-    {
-        "name": "get_bankroll",
-        "description": "Current balance, open bets, and available slots. Call immediately before submit_analysis.",
-        "input_schema": {"type": "object", "properties": {}, "required": []},
-    },
     {
         "name": "submit_analysis",
         "description": "Submit your analysis for this game. Always call this once per game after get_bankroll. The system automatically places a bet if edge >= 5% and slots are available — you do NOT decide whether to bet. Just report your honest edge calculation.",
@@ -871,7 +865,6 @@ def _dispatch_submit_analysis(a: dict) -> dict:
         )
 
 _PREFETCH_DISPATCH = {
-    "get_bankroll":    lambda a: t.get_bankroll(),
     "submit_analysis": _dispatch_submit_analysis,
     "cancel_bet":      lambda a: t.cancel_bet(**a),
     "save_note":       lambda a: t.save_note(**a),
