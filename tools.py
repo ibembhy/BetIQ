@@ -1239,6 +1239,21 @@ def calculate_implied_probability(odds: int) -> dict:
     }
 
 
+def get_elo_probability(home_team: str, away_team: str) -> dict:
+    """Elo-model win probability and implied spread for a matchup."""
+    try:
+        import elo
+        return elo.win_probability(home_team, away_team)
+    except Exception as exc:
+        log.warning(f"Elo probability lookup failed: {exc}")
+        return {
+            "home_team": home_team, "away_team": away_team,
+            "home_rating": 1500, "away_rating": 1500,
+            "home_prob_pct": 50.0, "away_prob_pct": 50.0,
+            "implied_spread": 0.0, "source": "unavailable",
+        }
+
+
 def _kelly_stake(balance: float, edge_pct: float, odds: int) -> tuple[float, float]:
     """
     Half-Kelly stake sizing. Returns (dollar_stake, kelly_fraction).
@@ -1761,6 +1776,13 @@ def _finalize_bet(bet: dict, home: str, away: str, home_score: int, away_score: 
 
     score_str = f"{home} {home_score} - {away} {away_score}"
     db.resolve_bet(bet["id"], status, pnl)
+
+    # Update Elo ratings after game resolution
+    try:
+        import elo as _elo
+        _elo.process_game_result(home, away, home_score, away_score, _current_season())
+    except Exception as exc:
+        log.warning(f"Elo update failed for {home} vs {away}: {exc}")
 
     # Generate post-game analysis report (Haiku, single call)
     try:

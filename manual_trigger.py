@@ -73,6 +73,7 @@ def _prefetch_game(home, away, shared):
         "advanced_away":      (t.get_advanced_stats,        (away,), {}),
         "roster_home":        (t.get_current_roster,        (home,), {}),
         "roster_away":        (t.get_current_roster,        (away,), {}),
+        "elo_prob":           (t.get_elo_probability,       (home, away), {}),
     }
     results = {}
     with ThreadPoolExecutor(max_workers=6) as ex:
@@ -120,6 +121,7 @@ def _prefetch_game(home, away, shared):
 **Injuries:** {j(results['injuries_away'])}
 
 ### Matchup Data
+**Elo model probability (use as baseline win probability):** {j(results['elo_prob'])}
 **Head-to-head:** {j(results['h2h'])}
 **Current odds:** {j(results['odds'])}
 **Book discrepancies ({home}):** {j(results['discrepancies_home'])}

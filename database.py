@@ -130,6 +130,17 @@ def init_db():
         )
     """)
 
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS elo_ratings (
+            team_id      INTEGER PRIMARY KEY,
+            team_name    TEXT    NOT NULL,
+            rating       REAL    NOT NULL DEFAULT 1500.0,
+            season       INTEGER NOT NULL,
+            games_played INTEGER NOT NULL DEFAULT 0,
+            updated_at   TEXT    NOT NULL
+        )
+    """)
+
     # Seed bankroll on first run
     c.execute("SELECT COUNT(*) FROM bankroll")
     if c.fetchone()[0] == 0:
@@ -446,5 +457,41 @@ def get_candidate_bets(limit: int = 50) -> list:
         "SELECT * FROM candidate_bets ORDER BY logged_at DESC LIMIT ?",
         (limit,),
     ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+# ── Elo ratings ────────────────────────────────────────────────────────────────
+
+def get_elo_rating(team_id: int) -> dict | None:
+    conn = get_connection()
+    row = conn.execute("SELECT * FROM elo_ratings WHERE team_id=?", (team_id,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def upsert_elo_rating(team_id: int, team_name: str, rating: float, season: int, games_played: int):
+    conn = get_connection()
+    conn.execute(
+        """
+        INSERT INTO elo_ratings (team_id, team_name, rating, season, games_played, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(team_id) DO UPDATE SET
+            team_name=excluded.team_name,
+            rating=excluded.rating,
+            season=excluded.season,
+            games_played=excluded.games_played,
+            updated_at=excluded.updated_at
+        """,
+        (team_id, team_name, round(rating, 2), season, games_played,
+         datetime.now(timezone.utc).isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_all_elo_ratings() -> list:
+    conn = get_connection()
+    rows = conn.execute("SELECT * FROM elo_ratings ORDER BY rating DESC").fetchall()
     conn.close()
     return [dict(r) for r in rows]

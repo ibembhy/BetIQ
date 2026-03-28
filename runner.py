@@ -86,6 +86,7 @@ def _prefetch_game(home: str, away: str, shared: dict) -> str:
         "advanced_away":      (t.get_advanced_stats,        (away,), {}),
         "roster_home":        (t.get_current_roster,        (home,), {}),
         "roster_away":        (t.get_current_roster,        (away,), {}),
+        "elo_prob":           (t.get_elo_probability,       (home, away), {}),
     }
 
     results = {}
@@ -134,6 +135,7 @@ def _prefetch_game(home: str, away: str, shared: dict) -> str:
 **Injuries:** {j(results['injuries_away'])}
 
 ### Matchup Data
+**Elo model probability (use as baseline win probability):** {j(results['elo_prob'])}
 **Head-to-head:** {j(results['h2h'])}
 **Current odds:** {j(results['odds'])}
 **Book discrepancies ({home}):** {j(results['discrepancies_home'])}
