@@ -74,6 +74,16 @@ def init_db():
         )
     """)
 
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS api_usage (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            api        TEXT NOT NULL,
+            endpoint   TEXT NOT NULL,
+            cached     INTEGER NOT NULL DEFAULT 0,
+            called_at  TEXT NOT NULL
+        )
+    """)
+
     # Add columns to existing databases that predate these features
     for col, definition in [
         ("closing_odds",      "INTEGER"),
@@ -82,6 +92,8 @@ def init_db():
         ("replaces_bet_id",   "INTEGER"),
         ("betfair_bet_id",    "TEXT"),
         ("betfair_market_id", "TEXT"),
+        ("bet_report",        "TEXT"),
+        ("edge_type",         "TEXT"),
     ]:
         try:
             c.execute(f"ALTER TABLE bets ADD COLUMN {col} {definition}")
@@ -92,6 +104,15 @@ def init_db():
         c.execute("ALTER TABLE odds_snapshots ADD COLUMN bookmaker_odds TEXT")
     except Exception:
         pass  # Column already exists
+
+    for col, definition in [
+        ("input_tokens",  "INTEGER DEFAULT 0"),
+        ("output_tokens", "INTEGER DEFAULT 0"),
+    ]:
+        try:
+            c.execute(f"ALTER TABLE api_usage ADD COLUMN {col} {definition}")
+        except Exception:
+            pass
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS candidate_bets (
@@ -173,6 +194,37 @@ def set_betfair_ids(bet_id: int, betfair_bet_id: str, betfair_market_id: str):
     )
     conn.commit()
     conn.close()
+
+
+def set_bet_report(bet_id: int, report: str):
+    conn = get_connection()
+    conn.execute("UPDATE bets SET bet_report=? WHERE id=?", (report, bet_id))
+    conn.commit()
+    conn.close()
+
+
+def log_api_call(api: str, endpoint: str, cached: bool = False,
+                 input_tokens: int = 0, output_tokens: int = 0):
+    try:
+        conn = get_connection()
+        conn.execute(
+            "INSERT INTO api_usage (api, endpoint, cached, called_at, input_tokens, output_tokens) VALUES (?, ?, ?, ?, ?, ?)",
+            (api, endpoint, 1 if cached else 0, datetime.now(timezone.utc).isoformat(),
+             input_tokens, output_tokens),
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass  # Never block main flow on logging
+
+
+def get_api_usage() -> list:
+    conn = get_connection()
+    rows = [dict(r) for r in conn.execute(
+        "SELECT * FROM api_usage ORDER BY called_at DESC"
+    ).fetchall()]
+    conn.close()
+    return rows
 
 
 def get_open_bets() -> list:
