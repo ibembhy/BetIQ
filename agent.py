@@ -912,21 +912,37 @@ def run_agent_prefetch(context: str, conversation_history: list) -> tuple[str, l
             return "\n".join(text_parts).strip() or "Analysis complete.", messages, all_thinking
 
         if response.stop_reason == "tool_use":
-            tool_results = []
+            summary_parts = []
             for block in response.content:
                 if block.type == "tool_use":
                     fn = _PREFETCH_DISPATCH.get(block.name)
                     try:
                         result = fn(block.input) if fn else {"error": f"Unknown tool: {block.name}"}
-                        result_str = json.dumps(result, default=str)
                     except Exception as exc:
-                        result_str = json.dumps({"error": str(exc)})
-                    tool_results.append({
-                        "type":        "tool_result",
-                        "tool_use_id": block.id,
-                        "content":     result_str,
-                    })
-            messages.append({"role": "user", "content": tool_results})
+                        result = {"error": str(exc)}
+
+                    # If submit_analysis was called, build summary and stop — no wrap-up turn needed
+                    if block.name == "submit_analysis":
+                        a = block.input
+                        action = "BET PLACED" if result.get("status") == "open" else "LOGGED"
+                        summary_parts.append(
+                            f"{action} — {a.get('matchup')} | {a.get('pick')} | "
+                            f"Edge: {a.get('edge_pct')}% | Confidence: {a.get('confidence')}\n"
+                            f"Reasoning: {a.get('reasoning', '')}"
+                        )
+                    elif block.name == "save_note":
+                        pass  # fire-and-forget, no summary needed
+                    else:
+                        # cancel_bet or other — execute and continue loop
+                        tool_results_single = [{
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": json.dumps(result, default=str),
+                        }]
+                        messages.append({"role": "user", "content": tool_results_single})
+
+            if summary_parts:
+                return "\n".join(summary_parts), messages, all_thinking
             continue
 
         break
