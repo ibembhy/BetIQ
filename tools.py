@@ -1431,6 +1431,7 @@ def evaluate_recommendation(
     confidence: str = "Medium",
     reasoning: str = "",
     llm_edge_pct: float = None,
+    lr_base_prob: float = None,
 ) -> dict:
     bankroll = db.get_balance()
     market_supported = bet_type in SUPPORTED_PROBABILITY_MARKETS
@@ -1459,7 +1460,12 @@ def evaluate_recommendation(
         selected_team = price_bundle.get("selected_team")
         other_team = price_bundle.get("other_team")
         selected_is_home = selected_team == home_team
-        base_prob = (elo_prob.get("home_prob_pct", 50.0) / 100.0) if selected_is_home else (elo_prob.get("away_prob_pct", 50.0) / 100.0)
+        elo_base = (elo_prob.get("home_prob_pct", 50.0) / 100.0) if selected_is_home else (elo_prob.get("away_prob_pct", 50.0) / 100.0)
+        # Blend LR model (60%) + Elo (40%) when available — LR is calibrated on 36K games
+        if lr_base_prob is not None:
+            base_prob = 0.6 * lr_base_prob + 0.4 * elo_base
+        else:
+            base_prob = elo_base
 
         public_game = _extract_public_game(public_pct, home_team, away_team)
         home_ticket = public_game.get("home_ticket_pct")
@@ -1574,6 +1580,7 @@ def submit_recommendation(
     replaces_bet_id: int = None,
     edge_type: str = None,
     llm_edge_pct: float = None,
+    lr_base_prob: float = None,
 ) -> dict:
     evaluation = evaluate_recommendation(
         matchup=matchup,
@@ -1583,6 +1590,7 @@ def submit_recommendation(
         confidence=confidence,
         reasoning=reasoning,
         llm_edge_pct=llm_edge_pct,
+        lr_base_prob=lr_base_prob,
     )
     open_count = len(db.get_open_bets())
 

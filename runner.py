@@ -23,6 +23,7 @@ from scan_context import build_prefetch_context, fetch_game_data, prefetch_share
 load_dotenv()
 
 import tools as t
+import model as _betiq_model
 from agent import run_agent, run_agent_prefetch
 from injury_monitor import poll_injuries
 
@@ -48,8 +49,32 @@ def _prefetch_shared() -> dict:
     return prefetch_shared_context(t)
 
 
-def _prefetch_game(home: str, away: str, shared: dict) -> str:
-    return build_prefetch_context(home, away, shared, fetch_game_data(home, away, t))
+def _prefetch_game(home: str, away: str, shared: dict) -> tuple[str, dict | None]:
+    """Returns (context_string, model_edge_info). model_edge_info is None if model unavailable."""
+    game_results = fetch_game_data(home, away, t)
+    model_edge_info = None
+    try:
+        features = _betiq_model.extract_features_from_prefetch(home, away, game_results)
+        # Extract home moneyline odds from the fetched odds
+        home_odds = None
+        odds_games = game_results.get("odds", {}).get("games", [])
+        if odds_games:
+            ml = odds_games[0].get("best_lines", {}).get("moneyline", {})
+            for team_name, price in ml.items():
+                if home.lower() in team_name.lower() or team_name.lower() in home.lower():
+                    home_odds = int(price)
+                    break
+        if home_odds is not None:
+            model_edge_info = _betiq_model.get_edge(home, away, features, home_odds)
+    except Exception as exc:
+        log.warning(f"Model edge computation failed for {home} vs {away}: {exc}")
+
+    context = build_prefetch_context(home, away, shared, game_results)
+    # Append model edge to context so Claude can validate and optionally override
+    if model_edge_info:
+        import json
+        context += f"\n\n### Statistical Model Edge (Logistic Regression — 36K game calibrated)\n{json.dumps(model_edge_info, default=str)}\n\nThe model's `edge_pct` is your **default edge to report** in `submit_analysis`. Override it only if you see a concrete reason (injury, trade, lineup change) the model cannot know about, and explain the override in `save_note`."
+    return context, model_edge_info
 
 
 def run_scan(label: str) -> None:
@@ -118,9 +143,9 @@ def run_scan(label: str) -> None:
             continue
         log.info(f"Pre-fetching data for {matchup}...")
         try:
-            context = _prefetch_game(home, away, shared)
-            log.info(f"Data ready. Sending to Claude for analysis...")
-            response, _, _ = run_agent_prefetch(context, conversation_history=[])
+            context, model_edge_info = _prefetch_game(home, away, shared)
+            log.info(f"Data ready. Model edge: {model_edge_info.get('edge_pct') if model_edge_info else 'N/A'}%. Sending to Claude for analysis...")
+            response, _, _ = run_agent_prefetch(context, conversation_history=[], model_edge_info=model_edge_info)
             log.info(f"{matchup} done.\n{response}")
             summaries.append(f"• {matchup}: {response[:300]}")
         except Exception as exc:

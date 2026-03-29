@@ -13,6 +13,7 @@ import pytz
 
 import database as db
 import tools as t
+import model as _betiq_model
 from agent import run_agent_prefetch
 from scan_context import build_prefetch_context, fetch_game_data, prefetch_shared_context
 
@@ -113,17 +114,36 @@ def _run_injury_scan(
         game_data = fetch_game_data(home, away, t)
         context = build_prefetch_context(home, away, shared, game_data)
 
+        # Compute model edge with fresh injury-adjusted data
+        model_edge_info = None
+        try:
+            features = _betiq_model.extract_features_from_prefetch(home, away, game_data)
+            odds_games = game_data.get("odds", {}).get("games", [])
+            home_odds = None
+            if odds_games:
+                ml = odds_games[0].get("best_lines", {}).get("moneyline", {})
+                for team_name, price in ml.items():
+                    if home.lower() in team_name.lower() or team_name.lower() in home.lower():
+                        home_odds = int(price)
+                        break
+            if home_odds is not None:
+                model_edge_info = _betiq_model.get_edge(home, away, features, home_odds)
+        except Exception:
+            pass
+
+        import json
         urgency_header = (
             f"## ⚡ URGENT — Injury-Triggered Scan\n"
             f"**Newly reported:** {injury_str}\n"
             f"**The line has NOT yet moved to reflect this.** "
             f"This is a time-sensitive opportunity — act before books adjust.\n"
-            f"Assess how much this injury shifts win probability. "
+            f"Statistical model edge (post-injury data): {json.dumps(model_edge_info, default=str)}\n"
+            f"Validate whether this injury materially changes the edge. "
             f"If real edge exists, submit immediately.\n\n"
         )
         context = urgency_header + context
 
-        response, _, _ = run_agent_prefetch(context, conversation_history=[])
+        response, _, _ = run_agent_prefetch(context, conversation_history=[], model_edge_info=model_edge_info)
         log.info(f"Injury scan complete — {matchup}:\n{response}")
         t._send_notification(
             title=f"BetIQ Injury Scan Complete — {matchup}",

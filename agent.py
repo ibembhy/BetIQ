@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 
 import tools as t
 import database as db
+import model as _betiq_model
 
 load_dotenv()
 
@@ -732,19 +733,23 @@ All game data AND bankroll info has been pre-fetched and is provided in the user
 - Never invent statistics or outcomes not present in the data. If data is missing, say so.
 - Every claim must trace back to a specific number or fact in the provided data.
 
-## Your task
-1. Analyze the provided data: stats, form, splits, rest, injuries, H2H, odds, public %, line movement, book discrepancies
-2. Estimate your win probability for the **moneyline only** — spreads and totals are not supported
-3. Calculate edge = your_prob − implied_prob
-4. Call `submit_analysis` AND `save_note` together in the same response — **the system decides automatically whether to bet or log**
+## Your role: Model Validator, not Probability Estimator
+
+A logistic regression model (trained on 36,000 NBA games, 7 features: Elo, rest, win%, home/away splits, form, net rating, H2H) has pre-computed a win probability and edge for this game. It is shown in the context under **"Statistical Model Edge"**.
+
+**Your job — in this order:**
+1. **Validate model inputs**: Check the data for injuries, trades, lineup changes, or other context the model cannot see
+2. **Trust or override**: If the model inputs look correct → use the model's `edge_pct` as your `edge_pct` in `submit_analysis`. If something material has changed (star player ruled out, trade last night, lineup change, travel fatigue) → adjust the edge and save a note explaining the override
+3. **Determine direction**: Pick which team to back (the model edge shown is from the home team's perspective — flip if you pick the away team)
+4. **Call `submit_analysis` AND `save_note`** in the same response — the system decides automatically whether to bet or log
+
+**Do NOT** estimate win probability from scratch — the model does that. You are the quality control layer.
 
 ## Bet type rules
-- **Moneyline:** Submit any edge — the Elo model decides whether to bet. Standard threshold.
-- **Spread or Total:** Only submit if you have genuine, high-conviction edge. The system requires **≥ 10% edge AND High confidence** to place — anything below is logged as a candidate. Do not submit spreads/totals speculatively.
+- **Moneyline:** Report the model's edge (or your override). The system's LR+Elo model decides whether to bet.
+- **Spread or Total:** Only submit if you have genuine, high-conviction edge independent of the model. The system requires **≥ 10% edge AND High confidence** to place — anything below is logged as a candidate.
 
-## ⚠️ KEY RULE — Report your honest edge, nothing else
-- You do NOT decide whether to place a bet. The system does that automatically based on your edge number.
-- If your model says 7% edge, report 7%. If it says 2%, report 2%.
+## ⚠️ KEY RULE — Report honest edge, never fabricate
 - Do NOT inflate or deflate your edge to influence whether a bet gets placed.
 - Do NOT skip calling `submit_analysis` — always call it once per game.
 - The bankroll and open bet count are already in the context — do NOT call get_bankroll.
@@ -764,9 +769,8 @@ All game data AND bankroll info has been pre-fetched and is provided in the user
 - Total spread ≥ 2.5 pts → may signal injury news or sharp total action
 
 ## How betting decisions are made (you do NOT control this)
-- The system runs its own Elo-based probability model after you call `submit_analysis`
-- A bet is placed ONLY if: Elo edge ≥ 5%, data quality score ≥ 65, and EV > 0
-- Your reported `edge_pct` is recorded for comparison but does NOT trigger the bet
+- The system blends your validated `edge_pct` with the LR + Elo model after you call `submit_analysis`
+- A bet is placed ONLY if: combined model edge ≥ 5%, data quality score ≥ 65, and EV > 0
 - Stake sizing is computed automatically via Half-Kelly — do NOT calculate it yourself
 - Do NOT mention bankroll limits or slot counts in your reasoning — the system enforces these
 
@@ -878,11 +882,34 @@ _PREFETCH_DISPATCH = {
 
 SPREAD_TOTAL_MIN_EDGE = 10.0  # Higher bar since no probability model backs these
 
-def _dispatch_submit_analysis_v2(a: dict) -> dict:
+
+def _lr_base_prob_for_pick(pick: str, matchup: str, model_edge_info: dict) -> float | None:
+    """
+    Given Claude's pick and the matchup string ("Away @ Home"), return the LR model's
+    win probability from the pick's perspective (home_prob or 1−home_prob).
+    Returns None if model_edge_info is unavailable.
+    """
+    if not model_edge_info:
+        return None
+    home_prob = model_edge_info.get("model_prob")
+    if home_prob is None:
+        return None
+    # Parse home team from "Away @ Home"
+    parts = matchup.split(" @ ")
+    home_team = parts[-1].strip() if len(parts) >= 2 else ""
+    pick_lower = pick.lower()
+    home_lower = home_team.lower()
+    # Check if pick matches the home team
+    if home_lower and (home_lower in pick_lower or pick_lower in home_lower):
+        return float(home_prob)
+    return float(1.0 - home_prob)
+
+
+def _dispatch_submit_analysis_v2(a: dict, model_edge_info: dict = None) -> dict:
     """
     Enforce downstream pricing and decision logic in code.
-    Moneyline: full Elo gate (edge ≥ 5%, DQ ≥ 65).
-    Spread/Total: no Elo model — only place if Claude reports ≥ 10% edge AND High confidence.
+    Moneyline: LR model (blended with Elo) drives the edge; Claude validates inputs.
+    Spread/Total: no probability model — only place if Claude reports ≥10% edge AND High confidence.
     """
     bet_type = a.get("bet_type", "moneyline")
     edge = float(a.get("edge_pct", 0))
@@ -914,6 +941,9 @@ def _dispatch_submit_analysis_v2(a: dict) -> dict:
                 reasoning=f"[{bet_type.upper()} requires ≥10% edge + High confidence — got {edge:.1f}% / {confidence}] " + a.get("reasoning", ""),
             )
 
+    # Moneyline: use LR model probability as base (blended with Elo inside evaluate_recommendation)
+    lr_prob = _lr_base_prob_for_pick(a.get("pick", ""), a.get("matchup", ""), model_edge_info)
+
     return t.submit_recommendation(
         matchup=a["matchup"],
         pick=a["pick"],
@@ -924,17 +954,23 @@ def _dispatch_submit_analysis_v2(a: dict) -> dict:
         game_date=a.get("game_date", ""),
         replaces_bet_id=a.get("replaces_bet_id"),
         llm_edge_pct=float(a.get("edge_pct", 0)),
+        lr_base_prob=lr_prob,
     )
 
 
 _PREFETCH_DISPATCH["submit_analysis"] = _dispatch_submit_analysis_v2
 
 
-def run_agent_prefetch(context: str, conversation_history: list) -> tuple[str, list, list]:
+def run_agent_prefetch(context: str, conversation_history: list, model_edge_info: dict = None) -> tuple[str, list, list]:
     """
     Agent run with pre-fetched data supplied in the context string.
     Only write tools are available — no data-fetching API calls.
+    model_edge_info: optional dict from model.get_edge() — used to blend LR probability with Elo for moneyline bets.
     """
+    # Build a local dispatch that captures model_edge_info for this specific game
+    _local_dispatch = dict(_PREFETCH_DISPATCH)
+    _local_dispatch["submit_analysis"] = lambda a: _dispatch_submit_analysis_v2(a, model_edge_info)
+
     messages = conversation_history + [{"role": "user", "content": context}]
     all_thinking: list[str] = []
     max_iterations = 10
@@ -975,7 +1011,7 @@ def run_agent_prefetch(context: str, conversation_history: list) -> tuple[str, l
             summary_parts = []
             for block in response.content:
                 if block.type == "tool_use":
-                    fn = _PREFETCH_DISPATCH.get(block.name)
+                    fn = _local_dispatch.get(block.name)
                     try:
                         result = fn(block.input) if fn else {"error": f"Unknown tool: {block.name}"}
                     except Exception as exc:
