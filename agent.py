@@ -738,10 +738,9 @@ All game data AND bankroll info has been pre-fetched and is provided in the user
 3. Calculate edge = your_prob − implied_prob
 4. Call `submit_analysis` AND `save_note` together in the same response — **the system decides automatically whether to bet or log**
 
-## ⚠️ MONEYLINE ONLY — No spreads or totals
-- The probability model only supports moneyline bets. Spread and total bets have no backing model and will be automatically rejected.
-- Always submit `bet_type: "moneyline"`. Never submit `bet_type: "spread"` or `bet_type: "total"`.
-- If you see no moneyline edge, submit with your honest edge % (even if low) and `bet_type: "moneyline"` — the system will log it as a candidate.
+## Bet type rules
+- **Moneyline:** Submit any edge — the Elo model decides whether to bet. Standard threshold.
+- **Spread or Total:** Only submit if you have genuine, high-conviction edge. The system requires **≥ 10% edge AND High confidence** to place — anything below is logged as a candidate. Do not submit spreads/totals speculatively.
 
 ## ⚠️ KEY RULE — Report your honest edge, nothing else
 - You do NOT decide whether to place a bet. The system does that automatically based on your edge number.
@@ -877,26 +876,43 @@ _PREFETCH_DISPATCH = {
 }
 
 
+SPREAD_TOTAL_MIN_EDGE = 10.0  # Higher bar since no probability model backs these
+
 def _dispatch_submit_analysis_v2(a: dict) -> dict:
     """
     Enforce downstream pricing and decision logic in code.
-    The model can propose a pick, but code computes the final
-    recommendation state and only places BET decisions.
-    Spreads and totals are hard-blocked until a probability model exists.
+    Moneyline: full Elo gate (edge ≥ 5%, DQ ≥ 65).
+    Spread/Total: no Elo model — only place if Claude reports ≥ 10% edge AND High confidence.
     """
     bet_type = a.get("bet_type", "moneyline")
+    edge = float(a.get("edge_pct", 0))
+    confidence = a.get("confidence", "Low")
+
     if bet_type in ("spread", "total"):
-        # Log as candidate with skip reason — never place
-        return t.log_candidate_bet(
-            matchup=a["matchup"],
-            pick=a["pick"],
-            bet_type=bet_type,
-            odds=a["odds"],
-            edge_pct=float(a.get("edge_pct", 0)),
-            confidence=a.get("confidence", "Low"),
-            skip_reason="unsupported_market_model",
-            reasoning=f"[AUTO-BLOCKED: {bet_type} bets have no probability model] " + a.get("reasoning", ""),
-        )
+        if edge >= SPREAD_TOTAL_MIN_EDGE and confidence == "High":
+            return t.place_paper_bet(
+                matchup=a["matchup"],
+                pick=a["pick"],
+                bet_type=bet_type,
+                odds=a["odds"],
+                confidence=confidence,
+                edge=edge,
+                reasoning=a.get("reasoning", ""),
+                game_date=a.get("game_date", ""),
+                replaces_bet_id=a.get("replaces_bet_id"),
+            )
+        else:
+            reason = "edge_below_threshold" if edge < SPREAD_TOTAL_MIN_EDGE else "low_confidence"
+            return t.log_candidate_bet(
+                matchup=a["matchup"],
+                pick=a["pick"],
+                bet_type=bet_type,
+                odds=a["odds"],
+                edge_pct=edge,
+                confidence=confidence,
+                skip_reason=reason,
+                reasoning=f"[{bet_type.upper()} requires ≥10% edge + High confidence — got {edge:.1f}% / {confidence}] " + a.get("reasoning", ""),
+            )
 
     return t.submit_recommendation(
         matchup=a["matchup"],
