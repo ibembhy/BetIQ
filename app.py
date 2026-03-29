@@ -296,49 +296,6 @@ html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
 </style>
 """, unsafe_allow_html=True)
 
-if "Bet History" in page and all_bets:
-    st.divider()
-    st.markdown("### Quantitative Detail")
-    hist_rows = []
-    for b in all_bets:
-        hist_rows.append({
-            "Pick": b["pick"],
-            "Decision": b.get("decision", "BET"),
-            "Odds": fo(b["odds"]),
-            "Implied %": f"{(b.get('market_implied_prob') or 0) * 100:.1f}%" if b.get("market_implied_prob") is not None else "n/a",
-            "Fair %": f"{(b.get('fair_prob_no_vig') or 0) * 100:.1f}%" if b.get("fair_prob_no_vig") is not None else "n/a",
-            "Model %": f"{(b.get('model_prob') or 0) * 100:.1f}%" if b.get("model_prob") is not None else "n/a",
-            "Edge %": f"{b.get('edge_pct', b.get('edge', 0)):+.1f}%" if b.get("edge_pct", b.get("edge")) is not None else "n/a",
-            "EV": _money_text(b.get("ev")),
-            "Stake": f"${(b.get('stake_amount') or b['stake']):.2f}",
-            "DQ": round(b.get("data_quality_score") or 0),
-            "Status": b["status"],
-        })
-    st.dataframe(pd.DataFrame(hist_rows), use_container_width=True, hide_index=True)
-
-if "Runner-Up Bets" in page:
-    candidates_detail = db.get_candidate_bets(limit=100)
-    if candidates_detail:
-        st.divider()
-        st.markdown("### Runner-Up Quant Detail")
-        runner_rows = []
-        for c in candidates_detail:
-            runner_rows.append({
-                "Pick": c["pick"],
-                "Decision": c.get("decision", "PASS"),
-                "Odds": fo(c["odds"]) if c.get("odds") else "n/a",
-                "Implied %": f"{(c.get('market_implied_prob') or 0) * 100:.1f}%" if c.get("market_implied_prob") is not None else "n/a",
-                "Fair %": f"{(c.get('fair_prob_no_vig') or 0) * 100:.1f}%" if c.get("fair_prob_no_vig") is not None else "n/a",
-                "Model %": f"{(c.get('model_prob') or 0) * 100:.1f}%" if c.get("model_prob") is not None else "n/a",
-                "Edge %": f"{c['edge_pct']:+.1f}%" if c.get("edge_pct") is not None else "n/a",
-                "EV": _money_text(c.get("ev")),
-                "Stake": f"${(c.get('stake_amount') or 0):.2f}" if c.get("stake_amount") is not None else "n/a",
-                "DQ": round(c.get("data_quality_score") or 0),
-                "Skip": c.get("skip_reason", ""),
-            })
-        st.dataframe(pd.DataFrame(runner_rows), use_container_width=True, hide_index=True)
-
-
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def pnl_color(val: float) -> str:
@@ -1137,6 +1094,26 @@ elif page == "📋 Bet History":
                 {reasoning_html}
             </div>""", unsafe_allow_html=True)
 
+        # ── Quantitative Detail table ──
+        st.divider()
+        st.markdown("### Quantitative Detail")
+        hist_rows = []
+        for b in filtered:
+            hist_rows.append({
+                "Pick": b["pick"],
+                "Decision": b.get("decision", "BET"),
+                "Odds": fo(b["odds"]),
+                "Implied %": f"{(b.get('market_implied_prob') or 0) * 100:.1f}%" if b.get("market_implied_prob") is not None else "n/a",
+                "Fair %": f"{(b.get('fair_prob_no_vig') or 0) * 100:.1f}%" if b.get("fair_prob_no_vig") is not None else "n/a",
+                "Model %": f"{(b.get('model_prob') or 0) * 100:.1f}%" if b.get("model_prob") is not None else "n/a",
+                "Edge %": f"{b.get('edge_pct', b.get('edge', 0)):+.1f}%" if b.get("edge_pct", b.get("edge")) is not None else "n/a",
+                "EV": _money_text(b.get("ev")),
+                "Stake": f"${(b.get('stake_amount') or b['stake']):.2f}",
+                "DQ": round(b.get("data_quality_score") or 0),
+                "Status": b["status"],
+            })
+        st.dataframe(pd.DataFrame(hist_rows), use_container_width=True, hide_index=True)
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # TAB 3 — Performance
@@ -1395,6 +1372,26 @@ elif page == "👀 Runner-Up Bets":
                 </div>
                 {f'<div class="bet-meta" style="margin-top:8px;">{c["reasoning"]}</div>' if c.get("reasoning") else ""}
             </div>""", unsafe_allow_html=True)
+
+        # ── Runner-Up Quant Detail table ──
+        st.divider()
+        st.markdown("### Runner-Up Quant Detail")
+        runner_rows = []
+        for c in filtered_c:
+            runner_rows.append({
+                "Pick": c["pick"],
+                "Decision": c.get("decision", "PASS"),
+                "Odds": fo(c["odds"]) if c.get("odds") else "n/a",
+                "Implied %": f"{(c.get('market_implied_prob') or 0) * 100:.1f}%" if c.get("market_implied_prob") is not None else "n/a",
+                "Fair %": f"{(c.get('fair_prob_no_vig') or 0) * 100:.1f}%" if c.get("fair_prob_no_vig") is not None else "n/a",
+                "Model %": f"{(c.get('model_prob') or 0) * 100:.1f}%" if c.get("model_prob") is not None else "n/a",
+                "Edge %": f"{c['edge_pct']:+.1f}%" if c.get("edge_pct") is not None else "n/a",
+                "EV": _money_text(c.get("ev")),
+                "Stake": f"${(c.get('stake_amount') or 0):.2f}" if c.get("stake_amount") is not None else "n/a",
+                "DQ": round(c.get("data_quality_score") or 0),
+                "Skip": c.get("skip_reason", ""),
+            })
+        st.dataframe(pd.DataFrame(runner_rows), use_container_width=True, hide_index=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
