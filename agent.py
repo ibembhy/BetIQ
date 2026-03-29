@@ -734,9 +734,14 @@ All game data AND bankroll info has been pre-fetched and is provided in the user
 
 ## Your task
 1. Analyze the provided data: stats, form, splits, rest, injuries, H2H, odds, public %, line movement, book discrepancies
-2. Estimate your win probability for the most promising bet type (ML, spread, or total)
+2. Estimate your win probability for the **moneyline only** — spreads and totals are not supported
 3. Calculate edge = your_prob − implied_prob
 4. Call `submit_analysis` AND `save_note` together in the same response — **the system decides automatically whether to bet or log**
+
+## ⚠️ MONEYLINE ONLY — No spreads or totals
+- The probability model only supports moneyline bets. Spread and total bets have no backing model and will be automatically rejected.
+- Always submit `bet_type: "moneyline"`. Never submit `bet_type: "spread"` or `bet_type: "total"`.
+- If you see no moneyline edge, submit with your honest edge % (even if low) and `bet_type: "moneyline"` — the system will log it as a candidate.
 
 ## ⚠️ KEY RULE — Report your honest edge, nothing else
 - You do NOT decide whether to place a bet. The system does that automatically based on your edge number.
@@ -777,7 +782,7 @@ MATCHUP: [Team A vs Team B]
 EDGE: [X% — your prob vs implied]
 REASONING: [2-3 sentences max on the decisive factors only]
 ```
-Do NOT write long essays. Calculate edge, call get_bankroll, call submit_analysis, call save_note. Done.
+Do NOT write long essays. Calculate edge, call submit_analysis, call save_note. Done.
 """
 
 PREFETCH_TOOLS = [
@@ -877,11 +882,26 @@ def _dispatch_submit_analysis_v2(a: dict) -> dict:
     Enforce downstream pricing and decision logic in code.
     The model can propose a pick, but code computes the final
     recommendation state and only places BET decisions.
+    Spreads and totals are hard-blocked until a probability model exists.
     """
+    bet_type = a.get("bet_type", "moneyline")
+    if bet_type in ("spread", "total"):
+        # Log as candidate with skip reason — never place
+        return t.log_candidate_bet(
+            matchup=a["matchup"],
+            pick=a["pick"],
+            bet_type=bet_type,
+            odds=a["odds"],
+            edge_pct=float(a.get("edge_pct", 0)),
+            confidence=a.get("confidence", "Low"),
+            skip_reason="unsupported_market_model",
+            reasoning=f"[AUTO-BLOCKED: {bet_type} bets have no probability model] " + a.get("reasoning", ""),
+        )
+
     return t.submit_recommendation(
         matchup=a["matchup"],
         pick=a["pick"],
-        bet_type=a["bet_type"],
+        bet_type=bet_type,
         odds=a["odds"],
         confidence=a.get("confidence", "Medium") if a.get("confidence") != "Low" else "Medium",
         reasoning=a.get("reasoning", ""),
