@@ -759,11 +759,12 @@ All game data AND bankroll info has been pre-fetched and is provided in the user
 - ML spread 8–14 pts → moderate signal
 - Total spread ≥ 2.5 pts → may signal injury news or sharp total action
 
-## Bankroll & stake rules
-- Half-Kelly sizing: f = (p·b − q) / b, halved, capped at 12% of bankroll
-- Pass `edge` and `odds` to `place_paper_bet` — stake is computed automatically
-- Never bet below 5% edge. Never exceed 5 open bets.
-- Always call `get_bankroll` immediately before `place_paper_bet`
+## How betting decisions are made (you do NOT control this)
+- The system runs its own Elo-based probability model after you call `submit_analysis`
+- A bet is placed ONLY if: Elo edge ≥ 5%, data quality score ≥ 65, and EV > 0
+- Your reported `edge_pct` is recorded for comparison but does NOT trigger the bet
+- Stake sizing is computed automatically via Half-Kelly — do NOT calculate it yourself
+- Do NOT mention bankroll limits or slot counts in your reasoning — the system enforces these
 
 ## Bet swapping
 If all 5 slots are full but your edge is 3%+ higher than the weakest open bet:
