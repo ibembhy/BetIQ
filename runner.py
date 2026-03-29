@@ -24,6 +24,7 @@ load_dotenv()
 
 import tools as t
 from agent import run_agent, run_agent_prefetch
+from injury_monitor import poll_injuries
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -247,12 +248,18 @@ if __name__ == "__main__":
     # 11:30 PM EST — final sweep for west coast late games
     scheduler.add_job(closing_snapshot,  "cron", hour=23, minute=30)
 
-    log.info("BetIQ runner started. Injury check 10:00 AM. Scans at 2:30 PM, 6:35 PM EST. Closing snapshots at 7:00 PM, 8:30 PM, 10:00 PM, 11:30 PM EST.")
+    # Injury monitor — every 30 min from 12:00 PM to 7:00 PM EST
+    # Polls ESPN (free), only hits Odds API if a new injury is detected
+    for _hour in range(12, 19):
+        scheduler.add_job(poll_injuries, "cron", hour=_hour, minute=0)
+        scheduler.add_job(poll_injuries, "cron", hour=_hour, minute=30)
+
+    log.info("BetIQ runner started. Injury check 10:00 AM. Scans at 2:30 PM, 6:35 PM EST. Closing snapshots at 7:00 PM, 8:30 PM, 10:00 PM, 11:30 PM EST. Injury monitor every 30 min 12–7 PM.")
     log.info("Press Ctrl+C to stop.")
 
     t._send_notification(
         title="BetIQ Runner Started",
-        message="Autonomous scanner is running.\nScans at 2:30 PM, 6:35 PM EST.\nClosing snapshots at 7:00 PM, 8:30 PM, 10:00 PM, 11:30 PM EST.\nYou'll be notified of every bet placed and resolved.",
+        message="Autonomous scanner is running.\nScans at 2:30 PM, 6:35 PM EST.\nInjury monitor every 30 min 12–7 PM.\nClosing snapshots at 7:00 PM, 8:30 PM, 10:00 PM, 11:30 PM EST.\nYou'll be notified of every bet placed and resolved.",
     )
 
     try:

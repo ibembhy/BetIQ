@@ -186,6 +186,27 @@ def init_db():
         )
     """)
 
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS injury_snapshots (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            game_date      TEXT NOT NULL,
+            team           TEXT NOT NULL,
+            player         TEXT NOT NULL,
+            status         TEXT NOT NULL,
+            snapshotted_at TEXT NOT NULL
+        )
+    """)
+
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS injury_triggers (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            game_date    TEXT NOT NULL,
+            matchup      TEXT NOT NULL,
+            triggered_at TEXT NOT NULL,
+            UNIQUE(game_date, matchup)
+        )
+    """)
+
     # Seed bankroll on first run
     c.execute("SELECT COUNT(*) FROM bankroll")
     if c.fetchone()[0] == 0:
@@ -587,3 +608,71 @@ def get_all_elo_ratings() -> list:
     rows = conn.execute("SELECT * FROM elo_ratings ORDER BY rating DESC").fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+# ── Injury monitor ─────────────────────────────────────────────────────────────
+
+def get_injury_snapshot(game_date: str, team: str) -> list:
+    """Return the last saved injury list for this team on this game date."""
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT player, status FROM injury_snapshots WHERE game_date=? AND team=?",
+        (game_date, team),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def save_injury_snapshot(game_date: str, team: str, injuries: list) -> None:
+    """Replace the stored snapshot for this team/date with the current injury list."""
+    now = datetime.now(timezone.utc).isoformat()
+    conn = get_connection()
+    conn.execute(
+        "DELETE FROM injury_snapshots WHERE game_date=? AND team=?",
+        (game_date, team),
+    )
+    for inj in injuries:
+        conn.execute(
+            "INSERT INTO injury_snapshots (game_date, team, player, status, snapshotted_at) VALUES (?,?,?,?,?)",
+            (game_date, team, inj.get("player", ""), inj.get("status", ""), now),
+        )
+    conn.commit()
+    conn.close()
+
+
+def is_injury_triggered(game_date: str, matchup: str) -> bool:
+    """Return True if an injury scan has already been triggered for this game today."""
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT id FROM injury_triggers WHERE game_date=? AND matchup=?",
+        (game_date, matchup),
+    ).fetchone()
+    conn.close()
+    return row is not None
+
+
+def mark_injury_triggered(game_date: str, matchup: str) -> None:
+    """Record that an injury-triggered scan has fired for this game today."""
+    conn = get_connection()
+    conn.execute(
+        "INSERT OR IGNORE INTO injury_triggers (game_date, matchup, triggered_at) VALUES (?,?,?)",
+        (game_date, matchup, datetime.now(timezone.utc).isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_first_odds_snapshot_today(home_team: str, game_date: str) -> dict | None:
+    """Return the earliest odds snapshot captured today for this home team."""
+    conn = get_connection()
+    row = conn.execute(
+        """
+        SELECT * FROM odds_snapshots
+        WHERE home_team LIKE ? AND captured_at >= ?
+        ORDER BY captured_at ASC
+        LIMIT 1
+        """,
+        (f"%{home_team}%", game_date),
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
