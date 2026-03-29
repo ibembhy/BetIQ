@@ -477,7 +477,7 @@ with st.sidebar:
         "Navigation",
         ["🏀 Today", "💬 Chat", "📋 Bet History", "📈 Performance",
          "📄 Daily Reports", "👀 Runner-Up Bets", "🔄 Replaced Bets",
-         "🔍 Bet Reports", "🔌 API Usage"],
+         "🔍 Bet Reports", "🔌 API Usage", "📊 Model Tracker"],
         label_visibility="collapsed",
         key="nav_page",
     )
@@ -1625,6 +1625,101 @@ elif page == "🔌 API Usage":
                 row["Cost"]            = f"${_row_cost(x):.5f}" if (inp or out) else "—"
             log_rows.append(row)
         st.dataframe(_pd.DataFrame(log_rows), use_container_width=True, hide_index=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TAB 9 — Model Tracker
+# ═══════════════════════════════════════════════════════════════════════════════
+
+elif page == "📊 Model Tracker":
+    st.markdown("### Model Tracker")
+    st.caption("Compares the Elo model edge vs Claude's self-reported edge vs actual outcome on resolved bets.")
+
+    tracked = [b for b in resolved if b.get("edge_pct") is not None or b.get("llm_edge_pct") is not None]
+
+    if not tracked:
+        st.info("No resolved bets with model data yet. Data appears after the next scan resolves.")
+    else:
+        # ── Summary stats ──
+        bets_with_both  = [b for b in tracked if b.get("edge_pct") is not None and b.get("llm_edge_pct") is not None]
+        elo_wins   = [b for b in tracked if b.get("edge_pct") is not None and b["status"] == "won"]
+        elo_losses = [b for b in tracked if b.get("edge_pct") is not None and b["status"] == "lost"]
+        avg_elo_edge_won  = sum(b["edge_pct"] for b in elo_wins)  / len(elo_wins)  if elo_wins  else None
+        avg_elo_edge_lost = sum(b["edge_pct"] for b in elo_losses) / len(elo_losses) if elo_losses else None
+
+        llm_wins   = [b for b in tracked if b.get("llm_edge_pct") is not None and b["status"] == "won"]
+        llm_losses = [b for b in tracked if b.get("llm_edge_pct") is not None and b["status"] == "lost"]
+        avg_llm_edge_won  = sum(b["llm_edge_pct"] for b in llm_wins)  / len(llm_wins)  if llm_wins  else None
+        avg_llm_edge_lost = sum(b["llm_edge_pct"] for b in llm_losses) / len(llm_losses) if llm_losses else None
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Bets Tracked", len(tracked))
+        c2.metric("Avg Elo Edge — Won",  f"{avg_elo_edge_won:+.1f}%"  if avg_elo_edge_won  is not None else "—")
+        c3.metric("Avg Elo Edge — Lost", f"{avg_elo_edge_lost:+.1f}%" if avg_elo_edge_lost is not None else "—")
+        c4.metric("Bets w/ Both Edges",  len(bets_with_both))
+
+        st.divider()
+
+        # ── Agreement rate ──
+        if bets_with_both:
+            agreed = sum(
+                1 for b in bets_with_both
+                if (b["edge_pct"] >= 5.0) == (b["llm_edge_pct"] >= 5.0)
+            )
+            st.markdown(f"**Model agreement rate** (both agree on BET vs PASS threshold): **{agreed}/{len(bets_with_both)} ({agreed/len(bets_with_both)*100:.0f}%)**")
+            st.divider()
+
+        # ── Per-bet table ──
+        st.markdown("#### Bet-by-Bet Comparison")
+        rows = []
+        for b in tracked:
+            elo_edge = b.get("edge_pct")
+            llm_edge = b.get("llm_edge_pct")
+            outcome  = b["status"].title()
+
+            # Did the models agree?
+            if elo_edge is not None and llm_edge is not None:
+                elo_said = "BET" if elo_edge >= 5.0 else "PASS"
+                llm_said = "BET" if llm_edge >= 5.0 else "PASS"
+                agreement = "✓" if elo_said == llm_said else "✗ Disagreed"
+            else:
+                agreement = "—"
+
+            rows.append({
+                "Date":       b.get("game_date", ""),
+                "Pick":       b["pick"],
+                "Elo Edge":   f"{elo_edge:+.1f}%" if elo_edge is not None else "—",
+                "Claude Edge": f"{llm_edge:+.1f}%" if llm_edge is not None else "—",
+                "Gap":        f"{(llm_edge - elo_edge):+.1f}%" if (elo_edge is not None and llm_edge is not None) else "—",
+                "DQ Score":   round(b.get("data_quality_score") or 0),
+                "Outcome":    outcome,
+                "P&L":        f"${b['pnl']:+.2f}",
+                "Agreement":  agreement,
+            })
+
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+        st.divider()
+
+        # ── Calibration insight ──
+        st.markdown("#### Calibration")
+        st.caption("When Claude's edge is much higher than Elo's, is Claude right or overconfident?")
+        if bets_with_both:
+            claude_higher_won  = [b for b in bets_with_both if b["llm_edge_pct"] > b["edge_pct"] + 3 and b["status"] == "won"]
+            claude_higher_lost = [b for b in bets_with_both if b["llm_edge_pct"] > b["edge_pct"] + 3 and b["status"] == "lost"]
+            elo_higher_won     = [b for b in bets_with_both if b["edge_pct"] > b["llm_edge_pct"] + 3 and b["status"] == "won"]
+            elo_higher_lost    = [b for b in bets_with_both if b["edge_pct"] > b["llm_edge_pct"] + 3 and b["status"] == "lost"]
+
+            cal_rows = [
+                {"Scenario": "Claude > Elo by 3%+", "Won": len(claude_higher_won), "Lost": len(claude_higher_lost),
+                 "Win Rate": f"{len(claude_higher_won)/(len(claude_higher_won)+len(claude_higher_lost))*100:.0f}%" if (claude_higher_won or claude_higher_lost) else "—"},
+                {"Scenario": "Elo > Claude by 3%+",  "Won": len(elo_higher_won),     "Lost": len(elo_higher_lost),
+                 "Win Rate": f"{len(elo_higher_won)/(len(elo_higher_won)+len(elo_higher_lost))*100:.0f}%" if (elo_higher_won or elo_higher_lost) else "—"},
+            ]
+            st.dataframe(pd.DataFrame(cal_rows), use_container_width=True, hide_index=True)
+            st.caption("If 'Claude > Elo' has a higher win rate, Claude is spotting real edges the model misses. If lower, Claude is overconfident.")
+        else:
+            st.info("Need bets with both edge values recorded to show calibration.")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
