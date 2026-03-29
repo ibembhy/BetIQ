@@ -20,3 +20,6 @@ venv/
 # OS
 .DS_Store
 Thumbs.db
+kalshi_private_key.pem
+kalshi.db
+scanner.log
