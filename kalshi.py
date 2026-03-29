@@ -117,6 +117,15 @@ def get_balance() -> dict:
         return {"error": str(e)}
 
 
+_MONTHS = {1:"JAN",2:"FEB",3:"MAR",4:"APR",5:"MAY",6:"JUN",
+           7:"JUL",8:"AUG",9:"SEP",10:"OCT",11:"NOV",12:"DEC"}
+
+
+def _ticker_date(dt: datetime) -> str:
+    """Convert datetime to Kalshi date string e.g. 26MAR29 — locale-independent."""
+    return f"{dt.strftime('%y')}{_MONTHS[dt.month]}{dt.strftime('%d')}"
+
+
 def get_today_games(include_tomorrow: bool = True) -> list[dict]:
     """
     Returns all open NBA game events for today (and tomorrow if include_tomorrow).
@@ -125,9 +134,9 @@ def get_today_games(include_tomorrow: bool = True) -> list[dict]:
     try:
         events = _get_client().get_events(series_ticker=NBA_SERIES, status="open", limit=50)
         now = datetime.now(EST)
-        valid_dates = {now.strftime("%y%b%d").upper()}
+        valid_dates = {_ticker_date(now)}
         if include_tomorrow:
-            valid_dates.add((now + timedelta(days=1)).strftime("%y%b%d").upper())
+            valid_dates.add(_ticker_date(now + timedelta(days=1)))
 
         results = []
         for e in (events.events or []):
