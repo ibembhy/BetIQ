@@ -13,6 +13,7 @@ from datetime import datetime, timedelta
 import betfairlightweight
 from betfairlightweight import filters as bf_filters
 from dotenv import load_dotenv
+from betting_math import american_odds_to_decimal
 
 load_dotenv()
 
@@ -39,9 +40,7 @@ def is_live() -> bool:
 
 def american_to_decimal(american_odds: int) -> float:
     """Convert American odds to Betfair decimal odds."""
-    if american_odds > 0:
-        return round(1 + american_odds / 100, 2)
-    return round(1 + 100 / abs(american_odds), 2)
+    return round(american_odds_to_decimal(american_odds), 2)
 
 
 def round_betfair_price(price: float) -> float:

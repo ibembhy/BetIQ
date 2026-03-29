@@ -13,6 +13,11 @@ No Claude API calls — pure Python/pandas, runs in seconds.
 import math
 import numpy as np
 import pandas as pd
+from betting_math import (
+    american_odds_to_implied_probability,
+    kelly_stake,
+    no_vig_probabilities_from_odds,
+)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -68,9 +73,7 @@ def _norm_cdf(x: float) -> float:
 
 def _implied_prob(american_odds: float) -> float:
     """American odds → raw implied probability (includes vig)."""
-    if american_odds > 0:
-        return 100 / (american_odds + 100)
-    return abs(american_odds) / (abs(american_odds) + 100)
+    return american_odds_to_implied_probability(american_odds)
 
 
 def _win_prob(home_avg_diff: float, away_avg_diff: float) -> float:
@@ -87,15 +90,15 @@ def _kelly_stake(
     bankroll: float, edge_pct: float, american_odds: float
 ) -> tuple[float, float]:
     """Half-Kelly stake. Returns (dollar_stake, fraction_pct)."""
-    if american_odds > 0:
-        b = american_odds / 100
-        impl = 100 / (american_odds + 100)
-    else:
-        b = 100 / abs(american_odds)
-        impl = abs(american_odds) / (abs(american_odds) + 100)
-    p = impl + edge_pct / 100
-    kelly = max((p * b - (1 - p)) / b, 0)
-    fraction = min(kelly * 0.5, KELLY_CAP)
+    implied = american_odds_to_implied_probability(american_odds)
+    win_probability = min(max(implied + edge_pct / 100, 0.0), 1.0)
+    _, fraction = kelly_stake(
+        bankroll=bankroll,
+        win_probability=win_probability,
+        odds=american_odds,
+        fractional_kelly=0.5,
+        max_fraction=KELLY_CAP,
+    )
     fraction = max(fraction, 0.01)
     return round(bankroll * fraction, 2), round(fraction * 100, 2)
 
@@ -160,11 +163,10 @@ def run_backtest(
             away_win_prob = 1 - home_win_prob
 
             # Remove vig: normalise implied probs to sum to 1
-            raw_home_impl = _implied_prob(game["moneyline_home"])
-            raw_away_impl = _implied_prob(game["moneyline_away"])
-            total_impl    = raw_home_impl + raw_away_impl
-            home_impl     = raw_home_impl / total_impl
-            away_impl     = raw_away_impl / total_impl
+            home_impl, away_impl = no_vig_probabilities_from_odds(
+                game["moneyline_home"],
+                game["moneyline_away"],
+            )
 
             home_edge = (home_win_prob - home_impl) * 100
             away_edge = (away_win_prob - away_impl) * 100

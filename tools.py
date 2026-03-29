@@ -28,6 +28,12 @@ except ImportError:
 
 import database as db
 import data_loader as dl
+from betting_math import (
+    american_odds_to_decimal,
+    american_odds_to_implied_probability,
+    expected_value,
+    kelly_stake,
+)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -1223,15 +1229,12 @@ def get_historical_odds(team_name: str = None, days_back: int = 3) -> dict:
 
 
 def calculate_implied_probability(odds: int) -> dict:
-    if odds > 0:
-        implied = 100 / (odds + 100)
-    else:
-        implied = abs(odds) / (abs(odds) + 100)
+    implied = american_odds_to_implied_probability(odds)
     return {
         "american_odds":          odds,
         "implied_probability":    round(implied, 4),
         "implied_probability_pct": round(implied * 100, 2),
-        "decimal_odds":           round(1 / implied, 3) if implied else None,
+        "decimal_odds":           round(american_odds_to_decimal(odds), 3),
         "note": (
             "Vig-adjusted fair probability is slightly higher. "
             "Compare to your estimated win probability to find edge."
@@ -1260,18 +1263,17 @@ def _kelly_stake(balance: float, edge_pct: float, odds: int) -> tuple[float, flo
     edge_pct: percentage edge (e.g. 8.0 for 8%).
     odds: American odds (e.g. -110, +150).
     """
-    if odds > 0:
-        b = odds / 100
-        implied = 100 / (odds + 100)
-    else:
-        b = 100 / abs(odds)
-        implied = abs(odds) / (abs(odds) + 100)
+    implied = american_odds_to_implied_probability(odds)
+    win_probability = min(max(implied + edge_pct / 100, 0.0), 1.0)
+    _, fraction = kelly_stake(
+        bankroll=balance,
+        win_probability=win_probability,
+        odds=odds,
+        fractional_kelly=0.5,
+        max_fraction=0.12,
+    )
 
-    p = implied + edge_pct / 100
-    kelly = max((p * b - (1 - p)) / b, 0)
-
-    # Half-Kelly, capped at 12% of bankroll, floored at 1%
-    fraction = min(kelly * 0.5, 0.12)
+    # Preserve current live behavior: accepted bets always stake at least 1% of bankroll.
     fraction = max(fraction, 0.01)
 
     return round(balance * fraction, 2), round(fraction * 100, 2)
@@ -1309,6 +1311,11 @@ def place_paper_bet(
         potential_payout = round(stake * (odds / 100) + stake, 2)
     else:
         potential_payout = round(stake * (100 / abs(odds)) + stake, 2)
+
+    implied_probability = american_odds_to_implied_probability(odds)
+    model_probability = min(max(implied_probability + edge / 100, 0.0), 1.0)
+    ev_dollars = round(expected_value(model_probability, odds, stake), 2)
+    ev_pct = round((ev_dollars / stake) * 100, 2) if stake else 0.0
 
     bet = {
         "game_date":       game_date or date.today().isoformat(),
@@ -1385,6 +1392,8 @@ def place_paper_bet(
         "potential_payout":   potential_payout,
         "confidence":         confidence,
         "edge_pct":           edge,
+        "expected_value":     ev_dollars,
+        "expected_value_pct": ev_pct,
         "new_balance":        round(balance - stake, 2),
         "betfair":            betfair_result,
         "message":            f"Bet #{bet_id} placed: ${stake:.2f} ({kelly_pct:.1f}% Kelly) on {pick} at {odds:+d}{bf_msg}",
