@@ -151,14 +151,16 @@ def _odds_get(endpoint: str, params: dict = None) -> dict | list:
 # ── Team resolution ───────────────────────────────────────────────────────────
 
 _teams_cache: dict = {}
+_teams_cache_ts: float = 0.0
+_TEAMS_CACHE_TTL: float = 60 * 60 * 6  # 6 hours
 
 def _get_all_teams() -> dict:
-    global _teams_cache
-    if _teams_cache:
+    global _teams_cache, _teams_cache_ts
+    if _teams_cache and (time.time() - _teams_cache_ts) < _TEAMS_CACHE_TTL:
         return _teams_cache
     data = _bdl_get("/teams", {"per_page": 100})
     if "error" in data or not data.get("data"):
-        return {}  # Don't cache failures — retry next call
+        return _teams_cache or {}  # Return stale cache on failure rather than empty
     result: dict = {}
     for team in data.get("data", []):
         for key in (
@@ -169,6 +171,7 @@ def _get_all_teams() -> dict:
         ):
             result[key] = team
     _teams_cache = result
+    _teams_cache_ts = time.time()
     return _teams_cache
 
 

@@ -937,8 +937,9 @@ def run_agent_prefetch(context: str, conversation_history: list) -> tuple[str, l
     """
     messages = conversation_history + [{"role": "user", "content": context}]
     all_thinking: list[str] = []
+    max_iterations = 10
 
-    while True:
+    for _iteration in range(max_iterations):
         response = None
         for attempt in range(6):
             try:
@@ -1006,4 +1007,4 @@ def run_agent_prefetch(context: str, conversation_history: list) -> tuple[str, l
 
         break
 
-    return "Agent loop ended unexpectedly.", messages, all_thinking
+    return "Agent loop hit max iterations (10) — check runner.log for details.", messages, all_thinking
