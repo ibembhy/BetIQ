@@ -20,6 +20,7 @@ from datetime import datetime
 import pytz
 from apscheduler.schedulers.blocking import BlockingScheduler
 from dotenv import load_dotenv
+from scan_context import build_prefetch_context, fetch_game_data, prefetch_shared_context
 
 load_dotenv()
 
@@ -147,6 +148,14 @@ def _prefetch_game(home: str, away: str, shared: dict) -> str:
 Analyse this game. If edge ≥ 5% and bankroll rules allow, place a bet. Otherwise log a candidate bet with the reason. Save a note with any pattern or lesson observed."""
 
 # ── Core scan function ─────────────────────────────────────────────────────────
+
+def _prefetch_shared() -> dict:
+    return prefetch_shared_context(t)
+
+
+def _prefetch_game(home: str, away: str, shared: dict) -> str:
+    return build_prefetch_context(home, away, shared, fetch_game_data(home, away, t))
+
 
 def run_scan(label: str) -> None:
     now = datetime.now(EST).strftime("%Y-%m-%d %H:%M EST")

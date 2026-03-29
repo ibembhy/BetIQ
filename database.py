@@ -44,7 +44,17 @@ def init_db():
             status           TEXT    NOT NULL DEFAULT 'open',
             pnl              REAL    DEFAULT 0.0,
             placed_at        TEXT    NOT NULL,
-            resolved_at      TEXT
+            resolved_at      TEXT,
+            model_prob       REAL,
+            market_implied_prob REAL,
+            fair_prob_no_vig REAL,
+            edge_pct         REAL,
+            ev               REAL,
+            stake_pct        REAL,
+            stake_amount     REAL,
+            data_quality_score REAL,
+            decision         TEXT,
+            llm_edge_pct     REAL
         )
     """)
 
@@ -94,6 +104,16 @@ def init_db():
         ("betfair_market_id", "TEXT"),
         ("bet_report",        "TEXT"),
         ("edge_type",         "TEXT"),
+        ("model_prob",        "REAL"),
+        ("market_implied_prob", "REAL"),
+        ("fair_prob_no_vig",  "REAL"),
+        ("edge_pct",          "REAL"),
+        ("ev",                "REAL"),
+        ("stake_pct",         "REAL"),
+        ("stake_amount",      "REAL"),
+        ("data_quality_score", "REAL"),
+        ("decision",          "TEXT"),
+        ("llm_edge_pct",      "REAL"),
     ]:
         try:
             c.execute(f"ALTER TABLE bets ADD COLUMN {col} {definition}")
@@ -126,9 +146,34 @@ def init_db():
             confidence TEXT    NOT NULL,
             skip_reason TEXT   NOT NULL,
             reasoning  TEXT,
-            logged_at  TEXT    NOT NULL
+            logged_at  TEXT    NOT NULL,
+            model_prob REAL,
+            market_implied_prob REAL,
+            fair_prob_no_vig REAL,
+            ev         REAL,
+            stake_pct  REAL,
+            stake_amount REAL,
+            data_quality_score REAL,
+            decision   TEXT,
+            llm_edge_pct REAL
         )
     """)
+
+    for col, definition in [
+        ("model_prob", "REAL"),
+        ("market_implied_prob", "REAL"),
+        ("fair_prob_no_vig", "REAL"),
+        ("ev", "REAL"),
+        ("stake_pct", "REAL"),
+        ("stake_amount", "REAL"),
+        ("data_quality_score", "REAL"),
+        ("decision", "TEXT"),
+        ("llm_edge_pct", "REAL"),
+    ]:
+        try:
+            c.execute(f"ALTER TABLE candidate_bets ADD COLUMN {col} {definition}")
+        except Exception:
+            pass
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS elo_ratings (
@@ -181,14 +226,26 @@ def insert_bet(bet: dict) -> int:
         """
         INSERT INTO bets
             (game_date, matchup, pick, bet_type, odds, stake, potential_payout,
-             confidence, edge, reasoning, status, placed_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,'open',?)
+             confidence, edge, reasoning, status, placed_at,
+             model_prob, market_implied_prob, fair_prob_no_vig, edge_pct, ev,
+             stake_pct, stake_amount, data_quality_score, decision, llm_edge_pct)
+        VALUES (?,?,?,?,?,?,?,?,?,?,'open',?,?,?,?,?,?,?,?,?,?)
         """,
         (
             bet["game_date"], bet["matchup"], bet["pick"], bet["bet_type"],
             bet["odds"], bet["stake"], bet["potential_payout"],
             bet["confidence"], bet["edge"], bet["reasoning"],
             datetime.now(timezone.utc).isoformat(),
+            bet.get("model_prob"),
+            bet.get("market_implied_prob"),
+            bet.get("fair_prob_no_vig"),
+            bet.get("edge_pct", bet.get("edge")),
+            bet.get("ev"),
+            bet.get("stake_pct"),
+            bet.get("stake_amount", bet.get("stake")),
+            bet.get("data_quality_score"),
+            bet.get("decision"),
+            bet.get("llm_edge_pct"),
         ),
     )
     bet_id = c.lastrowid
@@ -240,7 +297,7 @@ def get_api_usage() -> list:
 
 def get_open_bets() -> list:
     conn = get_connection()
-    rows = [dict(r) for r in conn.execute(
+    rows = [_normalize_bet_row(dict(r)) for r in conn.execute(
         "SELECT * FROM bets WHERE status='open' ORDER BY placed_at DESC"
     ).fetchall()]
     conn.close()
@@ -249,7 +306,7 @@ def get_open_bets() -> list:
 
 def get_all_bets() -> list:
     conn = get_connection()
-    rows = [dict(r) for r in conn.execute(
+    rows = [_normalize_bet_row(dict(r)) for r in conn.execute(
         "SELECT * FROM bets ORDER BY placed_at DESC"
     ).fetchall()]
     conn.close()
@@ -432,19 +489,32 @@ def save_candidate_bet(
     confidence: str,
     skip_reason: str,
     reasoning: str = "",
+    model_prob: float = None,
+    market_implied_prob: float = None,
+    fair_prob_no_vig: float = None,
+    ev: float = None,
+    stake_pct: float = None,
+    stake_amount: float = None,
+    data_quality_score: float = None,
+    decision: str = None,
+    llm_edge_pct: float = None,
 ):
     conn = get_connection()
     conn.execute(
         """
         INSERT INTO candidate_bets
             (game_date, matchup, pick, bet_type, odds, edge_pct,
-             confidence, skip_reason, reasoning, logged_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?)
+             confidence, skip_reason, reasoning, logged_at,
+             model_prob, market_implied_prob, fair_prob_no_vig, ev,
+             stake_pct, stake_amount, data_quality_score, decision, llm_edge_pct)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             game_date, matchup, pick, bet_type, odds,
             round(edge_pct, 2), confidence, skip_reason,
             reasoning, datetime.now(timezone.utc).isoformat(),
+            model_prob, market_implied_prob, fair_prob_no_vig, ev,
+            stake_pct, stake_amount, data_quality_score, decision, llm_edge_pct,
         ),
     )
     conn.commit()
@@ -458,7 +528,29 @@ def get_candidate_bets(limit: int = 50) -> list:
         (limit,),
     ).fetchall()
     conn.close()
-    return [dict(r) for r in rows]
+    return [_normalize_candidate_row(dict(r)) for r in rows]
+
+
+def _normalize_bet_row(row: dict) -> dict:
+    row["edge_pct"] = row.get("edge_pct", row.get("edge"))
+    if row["edge_pct"] is None:
+        row["edge_pct"] = row.get("edge")
+    row["stake_amount"] = row.get("stake_amount", row.get("stake"))
+    if row["stake_amount"] is None:
+        row["stake_amount"] = row.get("stake")
+    if row.get("stake_pct") is None and row.get("stake") and row.get("placed_at"):
+        row["stake_pct"] = None
+    if row.get("decision") is None:
+        row["decision"] = "BET" if row.get("status") != "cancelled" else "PASS"
+    return row
+
+
+def _normalize_candidate_row(row: dict) -> dict:
+    row["stake_amount"] = row.get("stake_amount", 0.0) or 0.0
+    row["stake_pct"] = row.get("stake_pct", 0.0) or 0.0
+    if row.get("decision") is None:
+        row["decision"] = "LEAN" if (row.get("edge_pct") or 0) >= 2.0 else "PASS"
+    return row
 
 
 # ── Elo ratings ────────────────────────────────────────────────────────────────

@@ -20,6 +20,7 @@ import pytz
 
 import tools as t
 from agent import run_agent_prefetch
+from scan_context import build_prefetch_context, fetch_game_data, prefetch_shared_context
 
 logging.basicConfig(
     level=logging.INFO,
@@ -34,6 +35,14 @@ logging.basicConfig(
 )
 log = logging.getLogger("betiq.manual")
 EST = pytz.timezone("America/New_York")
+
+
+def _prefetch_shared_v2():
+    return prefetch_shared_context(t)
+
+
+def _prefetch_game_v2(home, away, shared):
+    return build_prefetch_context(home, away, shared, fetch_game_data(home, away, t))
 
 
 def _prefetch_shared():
@@ -158,7 +167,7 @@ def run():
     except Exception as exc:
         log.warning(f"Pre-scan snapshot failed: {exc}")
 
-    shared = _prefetch_shared()
+    shared = _prefetch_shared_v2()
     log.info("Shared context pre-fetched.")
 
     for game in games.get("games", []):
@@ -180,7 +189,7 @@ def run():
             continue
         log.info(f"Pre-fetching data for {matchup}...")
         try:
-            context = _prefetch_game(home, away, shared)
+            context = _prefetch_game_v2(home, away, shared)
             log.info("Data ready. Sending to Claude...")
             response, _, _ = run_agent_prefetch(context, conversation_history=[])
             log.info(f"{matchup} done.\n{response}")

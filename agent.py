@@ -871,6 +871,28 @@ _PREFETCH_DISPATCH = {
 }
 
 
+def _dispatch_submit_analysis_v2(a: dict) -> dict:
+    """
+    Enforce downstream pricing and decision logic in code.
+    The model can propose a pick, but code computes the final
+    recommendation state and only places BET decisions.
+    """
+    return t.submit_recommendation(
+        matchup=a["matchup"],
+        pick=a["pick"],
+        bet_type=a["bet_type"],
+        odds=a["odds"],
+        confidence=a.get("confidence", "Medium") if a.get("confidence") != "Low" else "Medium",
+        reasoning=a.get("reasoning", ""),
+        game_date=a.get("game_date", ""),
+        replaces_bet_id=a.get("replaces_bet_id"),
+        llm_edge_pct=float(a.get("edge_pct", 0)),
+    )
+
+
+_PREFETCH_DISPATCH["submit_analysis"] = _dispatch_submit_analysis_v2
+
+
 def run_agent_prefetch(context: str, conversation_history: list) -> tuple[str, list, list]:
     """
     Agent run with pre-fetched data supplied in the context string.

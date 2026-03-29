@@ -296,6 +296,48 @@ html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
 </style>
 """, unsafe_allow_html=True)
 
+if "Bet History" in page and all_bets:
+    st.divider()
+    st.markdown("### Quantitative Detail")
+    hist_rows = []
+    for b in all_bets:
+        hist_rows.append({
+            "Pick": b["pick"],
+            "Decision": b.get("decision", "BET"),
+            "Odds": fo(b["odds"]),
+            "Implied %": f"{(b.get('market_implied_prob') or 0) * 100:.1f}%" if b.get("market_implied_prob") is not None else "n/a",
+            "Fair %": f"{(b.get('fair_prob_no_vig') or 0) * 100:.1f}%" if b.get("fair_prob_no_vig") is not None else "n/a",
+            "Model %": f"{(b.get('model_prob') or 0) * 100:.1f}%" if b.get("model_prob") is not None else "n/a",
+            "Edge %": f"{b.get('edge_pct', b.get('edge', 0)):+.1f}%" if b.get("edge_pct", b.get("edge")) is not None else "n/a",
+            "EV": _money_text(b.get("ev")),
+            "Stake": f"${(b.get('stake_amount') or b['stake']):.2f}",
+            "DQ": round(b.get("data_quality_score") or 0),
+            "Status": b["status"],
+        })
+    st.dataframe(pd.DataFrame(hist_rows), use_container_width=True, hide_index=True)
+
+if "Runner-Up Bets" in page:
+    candidates_detail = db.get_candidate_bets(limit=100)
+    if candidates_detail:
+        st.divider()
+        st.markdown("### Runner-Up Quant Detail")
+        runner_rows = []
+        for c in candidates_detail:
+            runner_rows.append({
+                "Pick": c["pick"],
+                "Decision": c.get("decision", "PASS"),
+                "Odds": fo(c["odds"]) if c.get("odds") else "n/a",
+                "Implied %": f"{(c.get('market_implied_prob') or 0) * 100:.1f}%" if c.get("market_implied_prob") is not None else "n/a",
+                "Fair %": f"{(c.get('fair_prob_no_vig') or 0) * 100:.1f}%" if c.get("fair_prob_no_vig") is not None else "n/a",
+                "Model %": f"{(c.get('model_prob') or 0) * 100:.1f}%" if c.get("model_prob") is not None else "n/a",
+                "Edge %": f"{c['edge_pct']:+.1f}%" if c.get("edge_pct") is not None else "n/a",
+                "EV": _money_text(c.get("ev")),
+                "Stake": f"${(c.get('stake_amount') or 0):.2f}" if c.get("stake_amount") is not None else "n/a",
+                "DQ": round(c.get("data_quality_score") or 0),
+                "Skip": c.get("skip_reason", ""),
+            })
+        st.dataframe(pd.DataFrame(runner_rows), use_container_width=True, hide_index=True)
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -367,7 +409,55 @@ def confidence_badge(conf: str) -> str:
     return f'<span class="bet-badge {cls}">{conf}</span>'
 
 def edge_badge(edge: float) -> str:
+    if edge is None:
+        return ""
     return f'<span class="bet-badge badge-edge">Edge {edge:.1f}%</span>'
+
+
+def decision_badge(decision: str) -> str:
+    colors = {
+        "BET": ("#14532d", "#4ade80"),
+        "LEAN": ("#422006", "#fb923c"),
+        "PASS": ("#334155", "#cbd5e1"),
+    }
+    bg, fg = colors.get(decision or "PASS", colors["PASS"])
+    return f'<span class="bet-badge" style="background:{bg};color:{fg};">{decision or "PASS"}</span>'
+
+
+def data_quality_badge(score: float | None) -> str:
+    if score is None:
+        return ""
+    color = "#22c55e" if score >= 75 else "#f59e0b" if score >= 55 else "#ef4444"
+    return f'<span class="bet-badge" style="background:#0f172a;color:{color};border:1px solid {color};">DQ {score:.0f}</span>'
+
+
+def _pct_text(value: float | None) -> str:
+    return "n/a" if value is None else f"{value * 100:.1f}%"
+
+
+def _money_text(value: float | None) -> str:
+    return "n/a" if value is None else f"${value:+.2f}"
+
+
+def pricing_summary_html(record: dict) -> str:
+    market = _pct_text(record.get("market_implied_prob"))
+    fair = _pct_text(record.get("fair_prob_no_vig"))
+    model = _pct_text(record.get("model_prob"))
+    edge = "n/a" if record.get("edge_pct") is None else f"{record['edge_pct']:+.1f}%"
+    ev = _money_text(record.get("ev"))
+    stake_amt = record.get("stake_amount")
+    stake_pct = record.get("stake_pct")
+    stake = "n/a"
+    if stake_amt is not None:
+        stake = f"${stake_amt:.2f}"
+        if stake_pct is not None:
+            stake += f" ({stake_pct:.1f}%)"
+    return (
+        '<div class="bet-meta" style="margin-top:6px;">'
+        f'Implied: {market} &nbsp;|&nbsp; Fair: {fair} &nbsp;|&nbsp; Model: {model} '
+        f'&nbsp;|&nbsp; Edge: {edge} &nbsp;|&nbsp; EV: {ev} &nbsp;|&nbsp; Stake: {stake}'
+        '</div>'
+    )
 
 _EDGE_TYPE_ICONS = {
     "injury":        ("🤕", "#f97316"),
@@ -514,6 +604,24 @@ with st.sidebar:
                 <div class="bet-meta" style="margin-top:4px;">Stake: ${bet['stake']:.2f}</div>
                 {reasoning_html}
             </div>""", unsafe_allow_html=True)
+
+    if open_bets:
+        st.markdown("**Decision details**")
+        open_rows = []
+        for bet in open_bets:
+            open_rows.append({
+                "Pick": bet["pick"],
+                "Decision": bet.get("decision", "BET"),
+                "Odds": fo(bet["odds"]),
+                "Implied %": f"{(bet.get('market_implied_prob') or 0) * 100:.1f}%" if bet.get("market_implied_prob") is not None else "n/a",
+                "Fair %": f"{(bet.get('fair_prob_no_vig') or 0) * 100:.1f}%" if bet.get("fair_prob_no_vig") is not None else "n/a",
+                "Model %": f"{(bet.get('model_prob') or 0) * 100:.1f}%" if bet.get("model_prob") is not None else "n/a",
+                "Edge %": f"{bet.get('edge_pct', bet.get('edge', 0)):+.1f}%" if bet.get("edge_pct", bet.get("edge")) is not None else "n/a",
+                "EV": _money_text(bet.get("ev")),
+                "Stake": f"${(bet.get('stake_amount') or bet['stake']):.2f}",
+                "DQ": round(bet.get("data_quality_score") or 0),
+            })
+        st.dataframe(pd.DataFrame(open_rows), use_container_width=True, hide_index=True)
 
     if st.button("Check Results", use_container_width=True):
         with st.spinner("Checking…"):

@@ -1,18 +1,19 @@
 # TODO
 
 ## Safe Incremental Improvements
-- Add deterministic helpers for market-level no-vig calculations on spreads and totals, not just head-to-head pairs.
-- Surface deterministic EV, implied probability, and fair probability in the UI for every placed bet and candidate bet.
-- Expose `betting_math.py` helpers through small wrapper tools only where the model genuinely needs them.
-- Add tests for CLV calculation and any edge-to-probability conversion assumptions in `tools.py`.
+- Finish surfacing deterministic pricing fields directly in the card-style UI components, not just supplemental tables.
+- Add tests for CLV calculation and the live recommendation evaluator in `tools.py`.
+- Persist and display data-quality penalty reasons alongside the numeric score.
+- Tighten stale-odds handling when the submitted odds differ from the current best line.
 - De-duplicate American/decimal odds formatting between `app.py`, `betfair.py`, and `betting_math.py`.
 
 ## Medium-Risk Refactors
-- Replace the duplicated prefetch context builders in `runner.py` and `manual_trigger.py` with one shared function/module.
-- Move the `submit_analysis` payload toward deterministic fields such as `model_win_probability` and let code compute implied probability, EV, and edge.
-- Store model probability separately from edge in the database so downstream analytics do not have to reconstruct it.
+- Move the `submit_analysis` payload toward deterministic fields such as `model_win_probability` or ranked market choices, and stop asking the LLM for an edge percentage at all.
+- Split the live evaluator out of `tools.py` into a dedicated service/module once the current pass stabilizes.
 - Centralize CLV, EV, and staking output formatting so app, reports, and notifications all show the same numbers.
 - Tighten fallback behavior when Elo data is unavailable so the system distinguishes "unknown" from a true 50/50 model.
+- Add a real deterministic spread model based on margin distribution before allowing spread bets to become `BET`.
+- Add a real deterministic totals model before allowing totals bets to become `BET`.
 
 ## Major Architectural Replacements
 - Replace LLM-authored edge estimation with a deterministic ensemble model that consumes the pre-fetched stats and outputs win probabilities directly.

@@ -33,6 +33,16 @@ from betting_math import (
     american_odds_to_implied_probability,
     expected_value,
     kelly_stake,
+    no_vig_probabilities_from_odds,
+)
+from decision_support import (
+    SUPPORTED_PROBABILITY_MARKETS,
+    clamp_probability,
+    compute_data_quality_score,
+    compute_moneyline_probability,
+    infer_decision,
+    recommendation_snapshot,
+    weighted_injury_count,
 )
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -1257,6 +1267,353 @@ def get_elo_probability(home_team: str, away_team: str) -> dict:
         }
 
 
+def _split_matchup(matchup: str) -> tuple[str | None, str | None]:
+    if " @ " in matchup:
+        away, home = matchup.split(" @ ", 1)
+        return away.strip(), home.strip()
+    if " vs " in matchup:
+        away, home = matchup.split(" vs ", 1)
+        return away.strip(), home.strip()
+    if " vs. " in matchup:
+        away, home = matchup.split(" vs. ", 1)
+        return away.strip(), home.strip()
+    return None, None
+
+
+def _team_matches_pick(team_name: str, pick: str) -> bool:
+    team_tokens = [t for t in re.findall(r"[A-Za-z]+", team_name.lower()) if len(t) > 2]
+    pick_l = pick.lower()
+    return any(token in pick_l for token in team_tokens)
+
+
+def _pick_team_from_matchup(matchup: str, pick: str) -> tuple[str | None, str | None]:
+    away, home = _split_matchup(matchup)
+    if not away or not home:
+        return None, None
+    if _team_matches_pick(home, pick):
+        return home, away
+    if _team_matches_pick(away, pick):
+        return away, home
+    return None, None
+
+
+def _find_current_market(matchup: str) -> tuple[dict | None, str | None, str | None]:
+    away, home = _split_matchup(matchup)
+    if not away or not home:
+        return None, None, None
+
+    odds_result = get_current_odds(home)
+    for game in odds_result.get("games", []):
+        if _matchup_matches(matchup, game.get("home_team", ""), game.get("away_team", "")):
+            return game, game.get("home_team"), game.get("away_team")
+    return None, home, away
+
+
+def _extract_public_game(public_pct: dict, home_team: str, away_team: str) -> dict:
+    if not isinstance(public_pct, dict):
+        return {}
+    for game in public_pct.get("games", []):
+        if _matchup_matches(f"{away_team} @ {home_team}", game.get("home_team", ""), game.get("away_team", "")):
+            return game
+    return {}
+
+
+def _safe_rest_days(rest: dict) -> int | None:
+    if not isinstance(rest, dict):
+        return None
+    return rest.get("days_rest")
+
+
+def _line_snapshot_count(line_move: dict) -> int:
+    if not isinstance(line_move, dict):
+        return 0
+    return int(line_move.get("snapshots", 0) or 0)
+
+
+def _market_price_bundle(matchup: str, pick: str, bet_type: str, submitted_odds: int) -> dict:
+    game, home_team, away_team = _find_current_market(matchup)
+    if not game:
+        return {
+            "matchup": matchup,
+            "current_odds_found": False,
+            "selected_side_found": False,
+            "opposite_side_found": False,
+            "home_team": home_team,
+            "away_team": away_team,
+            "submitted_odds": submitted_odds,
+        }
+
+    best = game.get("best_lines", {})
+    bundle = {
+        "matchup": matchup,
+        "current_odds_found": True,
+        "selected_side_found": False,
+        "opposite_side_found": False,
+        "home_team": home_team,
+        "away_team": away_team,
+        "submitted_odds": submitted_odds,
+    }
+
+    if bet_type == "moneyline":
+        selected_team, other_team = _pick_team_from_matchup(matchup, pick)
+        if not selected_team:
+            return bundle
+        selected_best = best.get("moneyline", {}).get(selected_team)
+        other_best = best.get("moneyline", {}).get(other_team)
+        bundle.update({
+            "selected_team": selected_team,
+            "other_team": other_team,
+            "selected_best_odds": selected_best,
+            "opposite_best_odds": other_best,
+            "selected_side_found": selected_best is not None,
+            "opposite_side_found": other_best is not None,
+            "market_implied_prob": american_odds_to_implied_probability(submitted_odds),
+        })
+        if other_best is not None:
+            submitted_side_fair, _ = no_vig_probabilities_from_odds(submitted_odds, other_best)
+            bundle["fair_prob_no_vig"] = submitted_side_fair
+        return bundle
+
+    if bet_type == "spread":
+        selected_team, other_team = _pick_team_from_matchup(matchup, pick)
+        if not selected_team:
+            return bundle
+        selected_info = best.get("spread", {}).get(selected_team, {})
+        other_info = best.get("spread", {}).get(other_team, {})
+        selected_best = selected_info.get("price")
+        other_best = other_info.get("price")
+        bundle.update({
+            "selected_team": selected_team,
+            "other_team": other_team,
+            "selected_best_odds": selected_best,
+            "opposite_best_odds": other_best,
+            "selected_side_found": selected_best is not None,
+            "opposite_side_found": other_best is not None,
+            "market_implied_prob": american_odds_to_implied_probability(submitted_odds),
+        })
+        if other_best is not None:
+            submitted_side_fair, _ = no_vig_probabilities_from_odds(submitted_odds, other_best)
+            bundle["fair_prob_no_vig"] = submitted_side_fair
+        return bundle
+
+    if bet_type == "total":
+        selected_side = "Over" if "over" in pick.lower() else "Under" if "under" in pick.lower() else None
+        other_side = "Under" if selected_side == "Over" else "Over" if selected_side == "Under" else None
+        selected_info = best.get("total", {}).get(selected_side, {}) if selected_side else {}
+        other_info = best.get("total", {}).get(other_side, {}) if other_side else {}
+        selected_best = selected_info.get("price")
+        other_best = other_info.get("price")
+        bundle.update({
+            "selected_team": selected_side,
+            "other_team": other_side,
+            "selected_best_odds": selected_best,
+            "opposite_best_odds": other_best,
+            "selected_side_found": selected_best is not None,
+            "opposite_side_found": other_best is not None,
+            "market_implied_prob": american_odds_to_implied_probability(submitted_odds),
+        })
+        if other_best is not None:
+            submitted_side_fair, _ = no_vig_probabilities_from_odds(submitted_odds, other_best)
+            bundle["fair_prob_no_vig"] = submitted_side_fair
+        return bundle
+
+    return bundle
+
+
+def evaluate_recommendation(
+    matchup: str,
+    pick: str,
+    bet_type: str,
+    odds: int,
+    confidence: str = "Medium",
+    reasoning: str = "",
+    llm_edge_pct: float = None,
+) -> dict:
+    bankroll = db.get_balance()
+    market_supported = bet_type in SUPPORTED_PROBABILITY_MARKETS
+    price_bundle = _market_price_bundle(matchup, pick, bet_type, odds)
+
+    away_team, home_team = _split_matchup(matchup)
+    home_team = price_bundle.get("home_team") or home_team
+    away_team = price_bundle.get("away_team") or away_team
+
+    rest_home = get_rest_days(home_team) if home_team else {}
+    rest_away = get_rest_days(away_team) if away_team else {}
+    injury_home = get_injury_report(home_team) if home_team else {}
+    injury_away = get_injury_report(away_team) if away_team else {}
+    roster_home = get_current_roster(home_team) if home_team else {}
+    roster_away = get_current_roster(away_team) if away_team else {}
+    public_pct = get_public_betting_percentages(home_team) if home_team else {}
+    line_home = get_line_movement(home_team) if home_team else {}
+    line_away = get_line_movement(away_team) if away_team else {}
+    elo_prob = get_elo_probability(home_team, away_team) if home_team and away_team else {"source": "unavailable"}
+
+    model_prob = None
+    model_detail = {}
+    conflicting_signals = False
+
+    if market_supported and home_team and away_team:
+        selected_team = price_bundle.get("selected_team")
+        other_team = price_bundle.get("other_team")
+        selected_is_home = selected_team == home_team
+        base_prob = (elo_prob.get("home_prob_pct", 50.0) / 100.0) if selected_is_home else (elo_prob.get("away_prob_pct", 50.0) / 100.0)
+
+        public_game = _extract_public_game(public_pct, home_team, away_team)
+        home_ticket = public_game.get("home_ticket_pct")
+        away_ticket = public_game.get("away_ticket_pct")
+        home_money = public_game.get("home_money_pct")
+        away_money = public_game.get("away_money_pct")
+
+        selected_ticket = home_ticket if selected_is_home else away_ticket
+        selected_money = home_money if selected_is_home else away_money
+        opponent_ticket = away_ticket if selected_is_home else home_ticket
+        opponent_money = away_money if selected_is_home else home_money
+
+        selected_rest = _safe_rest_days(rest_home if selected_is_home else rest_away)
+        opponent_rest = _safe_rest_days(rest_away if selected_is_home else rest_home)
+        selected_injury_weight = weighted_injury_count(injury_home if selected_is_home else injury_away)
+        opponent_injury_weight = weighted_injury_count(injury_away if selected_is_home else injury_home)
+        selected_ml_move = line_home.get("movement", {}).get("home_ml_move") if selected_is_home else line_away.get("movement", {}).get("away_ml_move")
+        opponent_ml_move = line_away.get("movement", {}).get("away_ml_move") if selected_is_home else line_home.get("movement", {}).get("home_ml_move")
+
+        model_detail = compute_moneyline_probability(
+            base_probability=base_prob,
+            selected_rest_days=selected_rest,
+            opponent_rest_days=opponent_rest,
+            selected_weighted_injuries=selected_injury_weight,
+            opponent_weighted_injuries=opponent_injury_weight,
+            selected_ticket_pct=selected_ticket,
+            selected_money_pct=selected_money,
+            opponent_ticket_pct=opponent_ticket,
+            opponent_money_pct=opponent_money,
+            selected_ml_move=selected_ml_move,
+            opponent_ml_move=opponent_ml_move,
+        )
+        model_prob = model_detail["adjusted_probability"]
+
+        line_adj = model_detail["adjustments"].get("line_movement", 0.0)
+        public_adj = model_detail["adjustments"].get("public_money", 0.0)
+        conflicting_signals = (line_adj < 0 and public_adj > 0) or (line_adj > 0 and public_adj < 0)
+
+    submitted_vs_market_delta = None
+    if price_bundle.get("selected_best_odds") is not None:
+        submitted_vs_market_delta = abs(int(price_bundle["selected_best_odds"]) - int(odds))
+
+    quality = compute_data_quality_score(
+        market_supported=market_supported,
+        current_odds_found=price_bundle.get("current_odds_found", False),
+        selected_side_found=price_bundle.get("selected_side_found", False),
+        opposite_side_found=price_bundle.get("opposite_side_found", False),
+        elo_source=elo_prob.get("source"),
+        rest_data_complete=_safe_rest_days(rest_home) is not None and _safe_rest_days(rest_away) is not None,
+        injury_data_complete="error" not in injury_home and "error" not in injury_away,
+        roster_data_complete=roster_home.get("count", 0) > 0 and roster_away.get("count", 0) > 0,
+        public_data_complete=bool(_extract_public_game(public_pct, home_team, away_team)),
+        line_snapshots=min(_line_snapshot_count(line_home), _line_snapshot_count(line_away)),
+        submitted_vs_market_delta=submitted_vs_market_delta,
+        conflicting_signals=conflicting_signals,
+    )
+
+    snapshot = recommendation_snapshot(
+        odds=odds,
+        bankroll=bankroll,
+        market_supported=market_supported,
+        model_probability=model_prob,
+        market_implied_probability=price_bundle.get("market_implied_prob"),
+        fair_probability_no_vig=price_bundle.get("fair_prob_no_vig"),
+        data_quality_score=quality["score"],
+        llm_edge_pct=llm_edge_pct,
+    )
+
+    if not market_supported and llm_edge_pct is not None:
+        snapshot["edge_pct"] = llm_edge_pct
+
+    signal_notes = quality["penalties"][:]
+    if not market_supported:
+        signal_notes.append("Market downgraded because no deterministic probability model is implemented for this market.")
+
+    return {
+        "matchup": matchup,
+        "pick": pick,
+        "bet_type": bet_type,
+        "odds": odds,
+        "confidence": confidence,
+        "reasoning": reasoning,
+        "market_supported": market_supported,
+        "home_team": home_team,
+        "away_team": away_team,
+        "model_detail": model_detail,
+        "signal_notes": signal_notes,
+        **snapshot,
+    }
+
+
+def _skip_reason_from_evaluation(evaluation: dict, open_count: int) -> str:
+    if open_count >= 5 and evaluation.get("decision") == "BET":
+        return "slots_full"
+    if not evaluation.get("market_supported"):
+        return "unsupported_market_model"
+    if (evaluation.get("data_quality_score") or 0) < 45:
+        return "low_confidence"
+    if evaluation.get("decision") == "LEAN":
+        return "edge_below_threshold"
+    return "other"
+
+
+def submit_recommendation(
+    matchup: str,
+    pick: str,
+    bet_type: str,
+    odds: int,
+    confidence: str,
+    reasoning: str,
+    game_date: str = None,
+    replaces_bet_id: int = None,
+    edge_type: str = None,
+    llm_edge_pct: float = None,
+) -> dict:
+    evaluation = evaluate_recommendation(
+        matchup=matchup,
+        pick=pick,
+        bet_type=bet_type,
+        odds=odds,
+        confidence=confidence,
+        reasoning=reasoning,
+        llm_edge_pct=llm_edge_pct,
+    )
+    open_count = len(db.get_open_bets())
+
+    if evaluation.get("decision") == "BET" and open_count < 5:
+        return _place_paper_bet_from_evaluation(
+            evaluation=evaluation,
+            game_date=game_date,
+            replaces_bet_id=replaces_bet_id,
+            edge_type=edge_type,
+        )
+
+    skip_reason = _skip_reason_from_evaluation(evaluation, open_count)
+    candidate = log_candidate_bet(
+        matchup=matchup,
+        pick=pick,
+        bet_type=bet_type,
+        odds=odds,
+        edge_pct=evaluation.get("edge_pct", llm_edge_pct or 0.0) or 0.0,
+        confidence=confidence,
+        skip_reason=skip_reason,
+        reasoning=reasoning,
+        model_prob=evaluation.get("model_prob"),
+        market_implied_prob=evaluation.get("market_implied_prob"),
+        fair_prob_no_vig=evaluation.get("fair_prob_no_vig"),
+        ev=evaluation.get("ev"),
+        stake_pct=evaluation.get("stake_pct"),
+        stake_amount=evaluation.get("stake_amount"),
+        data_quality_score=evaluation.get("data_quality_score"),
+        decision=evaluation.get("decision"),
+        llm_edge_pct=llm_edge_pct,
+    )
+    return {**candidate, **evaluation}
+
+
 def _kelly_stake(balance: float, edge_pct: float, odds: int) -> tuple[float, float]:
     """
     Half-Kelly stake sizing. Returns (dollar_stake, kelly_fraction).
@@ -1279,42 +1636,46 @@ def _kelly_stake(balance: float, edge_pct: float, odds: int) -> tuple[float, flo
     return round(balance * fraction, 2), round(fraction * 100, 2)
 
 
-def place_paper_bet(
-    matchup: str,
-    pick: str,
-    bet_type: str,
-    odds: int,
-    confidence: str,
-    edge: float,
-    reasoning: str,
+def _place_paper_bet_from_evaluation(
+    evaluation: dict,
     game_date: str = None,
     replaces_bet_id: int = None,
     edge_type: str = None,
 ) -> dict:
     balance    = db.get_balance()
     open_bets  = db.get_open_bets()
+    matchup = evaluation["matchup"]
+    pick = evaluation["pick"]
+    bet_type = evaluation["bet_type"]
+    odds = evaluation["odds"]
+    confidence = evaluation.get("confidence", "Medium")
+    reasoning = evaluation.get("reasoning", "")
+    edge = evaluation.get("edge_pct")
+    if edge is None:
+        edge = evaluation.get("llm_edge_pct", 0.0) or 0.0
 
     if len(open_bets) >= 5:
         return {"error": "Max 5 open bets already active. Wait for resolution.", "open_count": 5}
 
-    if edge < 5.0:
-        return {"error": f"Edge {edge:.1f}% is below 5% minimum. Bet skipped.", "edge": edge}
+    if evaluation.get("decision") != "BET":
+        return {"error": f"Recommendation decision is {evaluation.get('decision')}, not BET.", "decision": evaluation.get("decision")}
 
     if confidence not in ("High", "Medium"):
         confidence = "High" if edge >= 10.0 else "Medium"
 
-    # Half-Kelly stake sizing
-    stake, kelly_pct = _kelly_stake(balance, edge, odds)
-    stake = max(stake, 1.0)  # minimum $1
+    stake = round(evaluation.get("stake_amount", 0.0) or 0.0, 2)
+    kelly_pct = round(evaluation.get("stake_pct", 0.0) or 0.0, 2)
+    stake = max(stake, 1.0)
+    if kelly_pct <= 0:
+        stake, kelly_pct = _kelly_stake(balance, edge, odds)
+        stake = max(stake, 1.0)
 
     if odds > 0:
         potential_payout = round(stake * (odds / 100) + stake, 2)
     else:
         potential_payout = round(stake * (100 / abs(odds)) + stake, 2)
-
-    implied_probability = american_odds_to_implied_probability(odds)
-    model_probability = min(max(implied_probability + edge / 100, 0.0), 1.0)
-    ev_dollars = round(expected_value(model_probability, odds, stake), 2)
+    model_probability = evaluation.get("model_prob")
+    ev_dollars = round(evaluation.get("ev", 0.0) or 0.0, 2)
     ev_pct = round((ev_dollars / stake) * 100, 2) if stake else 0.0
 
     bet = {
@@ -1328,6 +1689,16 @@ def place_paper_bet(
         "confidence":      confidence,
         "edge":            edge,
         "reasoning":       reasoning,
+        "model_prob":      model_probability,
+        "market_implied_prob": evaluation.get("market_implied_prob"),
+        "fair_prob_no_vig": evaluation.get("fair_prob_no_vig"),
+        "edge_pct":        edge,
+        "ev":              ev_dollars,
+        "stake_pct":       kelly_pct,
+        "stake_amount":    stake,
+        "data_quality_score": evaluation.get("data_quality_score"),
+        "decision":        evaluation.get("decision"),
+        "llm_edge_pct":    evaluation.get("llm_edge_pct"),
     }
 
     bet_id = db.insert_bet(bet)
@@ -1370,7 +1741,12 @@ def place_paper_bet(
 
     _send_notification(
         title=f"BetIQ Bet Placed",
-        message=f"{pick} ({bet_type})\n{matchup}\nOdds: {odds:+d} | Edge: {edge:.1f}% | Confidence: {confidence}\nKelly: {kelly_pct:.1f}% | Stake: ${stake:.2f} | Balance: ${round(balance - stake, 2):.2f}{bf_msg}",
+        message=(
+            f"{pick} ({bet_type})\n{matchup}\nOdds: {odds:+d} | Decision: {evaluation.get('decision')} | "
+            f"Edge: {edge:.1f}% | EV: ${ev_dollars:+.2f} | Confidence: {confidence}\n"
+            f"Kelly: {kelly_pct:.1f}% | Stake: ${stake:.2f} | DQ: {evaluation.get('data_quality_score', 0):.0f} | "
+            f"Balance: ${round(balance - stake, 2):.2f}{bf_msg}"
+        ),
     )
 
     # Validate player names in reasoning against actual rosters
@@ -1392,12 +1768,74 @@ def place_paper_bet(
         "potential_payout":   potential_payout,
         "confidence":         confidence,
         "edge_pct":           edge,
+        "model_prob":         model_probability,
+        "market_implied_prob": evaluation.get("market_implied_prob"),
+        "fair_prob_no_vig":   evaluation.get("fair_prob_no_vig"),
         "expected_value":     ev_dollars,
         "expected_value_pct": ev_pct,
+        "stake_pct":          kelly_pct,
+        "stake_amount":       stake,
+        "data_quality_score": evaluation.get("data_quality_score"),
+        "decision":           evaluation.get("decision"),
+        "signal_notes":       evaluation.get("signal_notes", []),
         "new_balance":        round(balance - stake, 2),
         "betfair":            betfair_result,
         "message":            f"Bet #{bet_id} placed: ${stake:.2f} ({kelly_pct:.1f}% Kelly) on {pick} at {odds:+d}{bf_msg}",
     }
+
+
+def place_paper_bet(
+    matchup: str,
+    pick: str,
+    bet_type: str,
+    odds: int,
+    confidence: str,
+    edge: float,
+    reasoning: str,
+    game_date: str = None,
+    replaces_bet_id: int = None,
+    edge_type: str = None,
+) -> dict:
+    evaluation = evaluate_recommendation(
+        matchup=matchup,
+        pick=pick,
+        bet_type=bet_type,
+        odds=odds,
+        confidence=confidence,
+        reasoning=reasoning,
+        llm_edge_pct=edge,
+    )
+    if evaluation.get("decision") != "BET":
+        candidate = log_candidate_bet(
+            matchup=matchup,
+            pick=pick,
+            bet_type=bet_type,
+            odds=odds,
+            edge_pct=evaluation.get("edge_pct", edge) or edge,
+            confidence=confidence,
+            skip_reason=_skip_reason_from_evaluation(evaluation, len(db.get_open_bets())),
+            reasoning=reasoning,
+            model_prob=evaluation.get("model_prob"),
+            market_implied_prob=evaluation.get("market_implied_prob"),
+            fair_prob_no_vig=evaluation.get("fair_prob_no_vig"),
+            ev=evaluation.get("ev"),
+            stake_pct=evaluation.get("stake_pct"),
+            stake_amount=evaluation.get("stake_amount"),
+            data_quality_score=evaluation.get("data_quality_score"),
+            decision=evaluation.get("decision"),
+            llm_edge_pct=edge,
+        )
+        return {
+            "error": f"Recommendation downgraded to {evaluation.get('decision')} by deterministic evaluation.",
+            **candidate,
+            **evaluation,
+        }
+    return _place_paper_bet_from_evaluation(
+        evaluation=evaluation,
+        game_date=game_date,
+        replaces_bet_id=replaces_bet_id,
+        edge_type=edge_type,
+    )
 
 
 def cancel_bet(bet_id: int, reason: str = "") -> dict:
@@ -1462,6 +1900,8 @@ def get_bet_history() -> dict:
     clv_bets = [b for b in all_bets if b.get("clv") is not None]
     avg_clv  = sum(b["clv"] for b in clv_bets) / max(len(clv_bets), 1)
     pos_clv  = sum(1 for b in clv_bets if b["clv"] > 0)
+    scored_bets = [b for b in all_bets if b.get("data_quality_score") is not None]
+    avg_data_quality = sum(b["data_quality_score"] for b in scored_bets) / max(len(scored_bets), 1)
 
     return {
         "total_bets":              len(all_bets),
@@ -1477,6 +1917,7 @@ def get_bet_history() -> dict:
         "clv_tracked_bets":        len(clv_bets),
         "avg_clv_pct":             round(avg_clv * 100, 2),
         "positive_clv_rate_pct":   round(pos_clv / max(len(clv_bets), 1) * 100, 1),
+        "avg_data_quality_score":  round(avg_data_quality, 1) if scored_bets else None,
         "clv_note": (
             "Positive avg CLV = consistently beating the closing line = long-term edge. "
             "Negative CLV = entering too late or fading sharp money. "
@@ -1583,6 +2024,15 @@ def log_candidate_bet(
     confidence: str,
     skip_reason: str,
     reasoning: str = "",
+    model_prob: float = None,
+    market_implied_prob: float = None,
+    fair_prob_no_vig: float = None,
+    ev: float = None,
+    stake_pct: float = None,
+    stake_amount: float = None,
+    data_quality_score: float = None,
+    decision: str = None,
+    llm_edge_pct: float = None,
 ) -> dict:
     """
     Log a near-miss bet — a pick you analysed and liked but decided NOT to place.
@@ -1597,6 +2047,7 @@ def log_candidate_bet(
       'injury_uncertainty'   — key injury status unknown
       'line_moved_against'   — line moved unfavourably since opening
       'low_confidence'       — data too thin or conflicting to bet confidently
+      'unsupported_market_model' — no deterministic probability model exists for the selected market
       'other'                — explain in reasoning
     """
     game_date = date.today().isoformat()
@@ -1610,8 +2061,23 @@ def log_candidate_bet(
         confidence=confidence,
         skip_reason=skip_reason,
         reasoning=reasoning,
+        model_prob=model_prob,
+        market_implied_prob=market_implied_prob,
+        fair_prob_no_vig=fair_prob_no_vig,
+        ev=ev,
+        stake_pct=stake_pct,
+        stake_amount=stake_amount,
+        data_quality_score=data_quality_score,
+        decision=decision,
+        llm_edge_pct=llm_edge_pct,
     )
-    return {"logged": True, "pick": pick, "skip_reason": skip_reason}
+    return {
+        "logged": True,
+        "pick": pick,
+        "skip_reason": skip_reason,
+        "decision": decision,
+        "data_quality_score": data_quality_score,
+    }
 
 
 def snapshot_closing_odds() -> dict:
