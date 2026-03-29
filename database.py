@@ -243,6 +243,13 @@ def update_balance(new_balance: float):
 def insert_bet(bet: dict) -> int:
     conn = get_connection()
     c = conn.cursor()
+    # Enforce 5-bet cap inside a transaction so no race condition is possible
+    open_count = c.execute(
+        "SELECT COUNT(*) FROM bets WHERE status='open'"
+    ).fetchone()[0]
+    if open_count >= 5:
+        conn.close()
+        raise ValueError(f"Open bet cap reached ({open_count}/5) — bet not inserted.")
     c.execute(
         """
         INSERT INTO bets
@@ -476,10 +483,21 @@ def get_odds_snapshots(home_team: str, away_team: str, limit: int = 10) -> list:
 
 def add_agent_note(note_type: str, content: str):
     conn = get_connection()
+    now = datetime.now(timezone.utc).isoformat()
     conn.execute(
         "INSERT INTO agent_notes (note_type, content, created_at) VALUES (?,?,?)",
-        (note_type, content, datetime.now(timezone.utc).isoformat()),
+        (note_type, content, now),
     )
+    # Prune: delete notes older than 60 days
+    from datetime import timedelta
+    cutoff60 = (datetime.now(timezone.utc) - timedelta(days=60)).isoformat()
+    conn.execute("DELETE FROM agent_notes WHERE created_at < ?", (cutoff60,))
+    # Prune: keep only the 50 most recent notes
+    conn.execute("""
+        DELETE FROM agent_notes WHERE id NOT IN (
+            SELECT id FROM agent_notes ORDER BY created_at DESC LIMIT 50
+        )
+    """)
     conn.commit()
     conn.close()
 
