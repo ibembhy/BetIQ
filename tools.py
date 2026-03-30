@@ -7,12 +7,16 @@ import logging
 import os
 import re
 import time
+import threading
 import requests
+from dotenv import load_dotenv
 
 log = logging.getLogger("betiq.tools")
 from datetime import datetime, date
 from typing import Optional
 from functools import lru_cache
+
+load_dotenv()
 
 try:
     from nba_api.stats.static import teams as _nba_static_teams
@@ -58,6 +62,9 @@ BDL_BASE  = "https://api.balldontlie.io/v1"
 # Simple in-memory cache {key: (data, timestamp)}
 _cache: dict = {}
 _CACHE_TTL = 300  # 5 minutes
+_bdl_rate_lock = threading.Lock()
+_bdl_last_request_ts = 0.0
+_BDL_MIN_INTERVAL_SECONDS = float(os.getenv("BALLDONTLIE_MIN_INTERVAL_SECONDS", "1.05"))
 
 
 def _send_notification(title: str, message: str, tags: str = "") -> None:
@@ -66,7 +73,7 @@ def _send_notification(title: str, message: str, tags: str = "") -> None:
         return
     try:
         text = f"*{title}*\n{message}"
-        requests.post(
+        _http_session().post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
             json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"},
             timeout=5,
@@ -88,6 +95,12 @@ def _set_cache(key: str, data):
     _cache[key] = (data, time.time())
 
 
+def _http_session() -> requests.Session:
+    session = requests.Session()
+    session.trust_env = False
+    return session
+
+
 # ── HTTP helpers ──────────────────────────────────────────────────────────────
 
 def _bdl_headers() -> dict:
@@ -98,7 +111,8 @@ def _bdl_headers() -> dict:
 
 
 def _bdl_get(endpoint: str, params: dict = None) -> dict:
-    """GET from Balldontlie v1. Handles array params like dates[]."""
+    """GET from Balldontlie v1. Handles array params like dates[]. Retries on 429."""
+    global _bdl_last_request_ts
     param_list = []
     for key, value in (params or {}).items():
         if isinstance(value, list):
@@ -106,23 +120,36 @@ def _bdl_get(endpoint: str, params: dict = None) -> dict:
                 param_list.append((key, v))
         else:
             param_list.append((key, value))
-    try:
-        r = requests.get(
-            f"{BDL_BASE}{endpoint}",
-            params=param_list or None,
-            headers=_bdl_headers(),
-            timeout=15,
-        )
-        if r.status_code == 401:
-            return {"error": "Balldontlie API key required. Add BALLDONTLIE_API_KEY to .env"}
-        r.raise_for_status()
-        db.log_api_call("BallDontLie", endpoint)
-        return r.json()
-    except requests.HTTPError as e:
-        db.log_api_call("BallDontLie", endpoint)
-        return {"error": f"HTTP {r.status_code}: {r.text[:300]}"}
-    except Exception as e:
-        return {"error": str(e)}
+    for attempt in range(4):
+        try:
+            with _bdl_rate_lock:
+                if _BDL_MIN_INTERVAL_SECONDS > 0:
+                    elapsed = time.monotonic() - _bdl_last_request_ts
+                    if elapsed < _BDL_MIN_INTERVAL_SECONDS:
+                        time.sleep(_BDL_MIN_INTERVAL_SECONDS - elapsed)
+                _bdl_last_request_ts = time.monotonic()
+            r = _http_session().get(
+                f"{BDL_BASE}{endpoint}",
+                params=param_list or None,
+                headers=_bdl_headers(),
+                timeout=15,
+            )
+            if r.status_code == 429:
+                wait = 5 * (2 ** attempt)   # 5, 10, 20, 40 seconds
+                log.warning(f"BDL rate limit hit — waiting {wait}s (attempt {attempt + 1}/4)...")
+                time.sleep(wait)
+                continue
+            if r.status_code == 401:
+                return {"error": "Balldontlie API key required. Add BALLDONTLIE_API_KEY to .env"}
+            r.raise_for_status()
+            db.log_api_call("BallDontLie", endpoint)
+            return r.json()
+        except requests.HTTPError as e:
+            db.log_api_call("BallDontLie", endpoint)
+            return {"error": f"HTTP {r.status_code}: {r.text[:300]}"}
+        except Exception as e:
+            return {"error": str(e)}
+    return {"error": "BDL rate limit exceeded after 4 attempts"}
 
 
 def _odds_get(endpoint: str, params: dict = None) -> dict | list:
@@ -135,7 +162,7 @@ def _odds_get(endpoint: str, params: dict = None) -> dict | list:
         return cached
     p["apiKey"] = ODDS_API_KEY
     try:
-        r = requests.get(f"{ODDS_BASE}{endpoint}", params=p, timeout=15)
+        r = _http_session().get(f"{ODDS_BASE}{endpoint}", params=p, timeout=15)
         r.raise_for_status()
         result = r.json()
         _cache[cache_key] = (result, time.time())
@@ -154,6 +181,29 @@ _teams_cache: dict = {}
 _teams_cache_ts: float = 0.0
 _TEAMS_CACHE_TTL: float = 60 * 60 * 6  # 6 hours
 
+
+def _team_entry_score(team: dict) -> int:
+    """Prefer current canonical NBA team records over legacy duplicates."""
+    score = 0
+    if team.get("conference", "").strip():
+        score += 2
+    if team.get("division", "").strip():
+        score += 2
+    if team.get("city", "").strip():
+        score += 1
+    if len(team.get("abbreviation", "").strip()) == 3:
+        score += 2
+    team_id = team.get("id")
+    if isinstance(team_id, int) and 1 <= team_id <= 30:
+        score += 3
+    return score
+
+
+def _set_preferred_team_alias(aliases: dict, key: str, team: dict) -> None:
+    existing = aliases.get(key)
+    if existing is None or _team_entry_score(team) > _team_entry_score(existing):
+        aliases[key] = team
+
 def _get_all_teams() -> dict:
     global _teams_cache, _teams_cache_ts
     if _teams_cache and (time.time() - _teams_cache_ts) < _TEAMS_CACHE_TTL:
@@ -169,7 +219,7 @@ def _get_all_teams() -> dict:
             team["abbreviation"].lower(),
             team["city"].lower(),
         ):
-            result[key] = team
+            _set_preferred_team_alias(result, key, team)
     _teams_cache = result
     _teams_cache_ts = time.time()
     return _teams_cache
@@ -184,6 +234,55 @@ def _resolve_team(name: str) -> Optional[dict]:
         if nl in key or key in nl:
             return team
     return None
+
+
+def _get_bdl_team_games(team_id: int, season: int, per_page: int = 100) -> dict:
+    cache_key = f"bdl_games_team_{team_id}_{season}_{per_page}"
+    if cached := _cached(cache_key):
+        db.log_api_call("BallDontLie", "/games", cached=True)
+        return cached
+    data = _bdl_get("/games", {"seasons[]": season, "team_ids[]": team_id, "per_page": per_page})
+    if "error" not in data:
+        _set_cache(cache_key, data)
+    return data
+
+
+def _build_team_stats_from_games(team: dict, season: int, games_data: dict) -> dict:
+    finished = [g for g in games_data.get("data", []) if g.get("status") == "Final"]
+    wins = losses = 0
+    pts_for_total = pts_against_total = 0
+
+    for g in finished:
+        home = g["home_team"]["id"] == team["id"]
+        pts_for = g["home_team_score"] if home else g["visitor_team_score"]
+        pts_against = g["visitor_team_score"] if home else g["home_team_score"]
+        pts_for_total += pts_for
+        pts_against_total += pts_against
+        if pts_for > pts_against:
+            wins += 1
+        else:
+            losses += 1
+
+    gp = len(finished)
+    avg_pts_for = round(pts_for_total / max(gp, 1), 1)
+    avg_pts_against = round(pts_against_total / max(gp, 1), 1)
+    net_rtg = round(avg_pts_for - avg_pts_against, 1)
+    win_pct = round(wins / max(wins + losses, 1), 3)
+
+    return {
+        "team": team["full_name"],
+        "season": season,
+        "source": "bdl_games_derived",
+        "record": {"wins": wins, "losses": losses, "win_pct": win_pct},
+        "averages": [{
+            "gp": gp,
+            "win_pct": win_pct,
+            "pts": avg_pts_for,
+            "pts_allowed": avg_pts_against,
+            "net_rtg": net_rtg,
+            "plus_minus": net_rtg,
+        }],
+    }
 
 
 _NBA_HEADERS = {
@@ -210,6 +309,23 @@ def _nba_team_id(team_name: str) -> Optional[int]:
 def _nba_season_str() -> str:
     s = _current_season()
     return f"{s}-{str(s + 1)[-2:]}"
+
+
+def _nba_season_candidates(season: int | None = None) -> list[tuple[int, str]]:
+    base = season if season is not None else _current_season()
+    years = [base]
+    if base == _current_season():
+        years.append(base - 1)
+
+    seen = set()
+    candidates: list[tuple[int, str]] = []
+    for start_year in years:
+        if start_year in seen:
+            continue
+        seen.add(start_year)
+        candidates.append((start_year, f"{start_year}-{str(start_year + 1)[-2:]}"))
+    return candidates
+
 
 def _current_season() -> int:
     now = datetime.now()
@@ -308,28 +424,15 @@ def get_team_stats(team_name: str, season: int = None) -> dict:
             except Exception:
                 pass
 
-    # BDL fallback
+    # BDL fallback derived from game results. This avoids premium-only
+    # season-average endpoints while still giving the model the fields it needs.
     team = _resolve_team(team_name)
     if not team:
         return {"error": f"Team not found: {team_name}"}
-    avg_data = _bdl_get("/season_averages", {"season": season, "team_ids[]": team["id"]})
-    games_data = _bdl_get("/games", {"seasons[]": season, "team_ids[]": team["id"], "per_page": 100})
-    wins = losses = 0
-    if "data" in games_data:
-        for g in games_data["data"]:
-            if g.get("status") != "Final":
-                continue
-            if g["home_team"]["id"] == team["id"]:
-                if g["home_team_score"] > g["visitor_team_score"]: wins += 1
-                else: losses += 1
-            else:
-                if g["visitor_team_score"] > g["home_team_score"]: wins += 1
-                else: losses += 1
-    result = {
-        "team": team["full_name"], "season": season, "source": "bdl",
-        "record": {"wins": wins, "losses": losses, "win_pct": round(wins/max(wins+losses,1), 3)},
-        "averages": avg_data.get("data", []),
-    }
+    games_data = _get_bdl_team_games(team["id"], season)
+    if "error" in games_data:
+        return games_data
+    result = _build_team_stats_from_games(team, season, games_data)
     _set_cache(cache_key, result)
     return result
 
@@ -359,46 +462,49 @@ def get_recent_form(team_name: str, last_n: int = 10) -> dict:
     if _NBA_API_AVAILABLE:
         team_id = _nba_team_id(team_name)
         if team_id:
-            try:
-                time.sleep(0.6)
-                ep = TeamGameLog(team_id=team_id, season=_nba_season_str(), timeout=15, headers=_NBA_HEADERS)
-                df = ep.team_game_log.get_data_frame().head(last_n)
-                form = []
-                for _, row in df.iterrows():
-                    matchup = str(row.get("MATCHUP", ""))
-                    home = " vs. " in matchup
-                    opponent = matchup.split(" vs. ")[-1] if home else matchup.split(" @ ")[-1]
-                    pts_for = int(row.get("PTS", 0))
-                    margin = int(row.get("PLUS_MINUS", 0))
-                    pts_against = pts_for - margin
-                    form.append({
-                        "date": str(row.get("GAME_DATE", ""))[:10],
-                        "opponent": opponent,
-                        "location": "Home" if home else "Away",
-                        "score": f"{pts_for}-{pts_against}",
-                        "result": str(row.get("WL", "")),
-                        "margin": margin,
-                        "source": "nba_api",
-                    })
-                wins = sum(1 for g in form if g["result"] == "W")
-                result = {
-                    "team": team_name, "games_back": len(form),
-                    "record": f"{wins}-{len(form) - wins}",
-                    "win_pct": round(wins / max(len(form), 1), 3),
-                    "avg_margin": round(sum(g["margin"] for g in form) / max(len(form), 1), 1),
-                    "form": form,
-                }
-                _set_cache(cache_key, result)
-                return result
-            except Exception:
-                pass
+            for _, season_str in _nba_season_candidates():
+                try:
+                    time.sleep(0.6)
+                    ep = TeamGameLog(team_id=team_id, season=season_str, timeout=15, headers=_NBA_HEADERS)
+                    df = ep.team_game_log.get_data_frame().head(last_n)
+                    if df.empty:
+                        continue
+                    form = []
+                    for _, row in df.iterrows():
+                        matchup = str(row.get("MATCHUP", ""))
+                        home = " vs. " in matchup
+                        opponent = matchup.split(" vs. ")[-1] if home else matchup.split(" @ ")[-1]
+                        pts_for = int(row.get("PTS", 0))
+                        margin = int(row.get("PLUS_MINUS", 0))
+                        pts_against = pts_for - margin
+                        form.append({
+                            "date": str(row.get("GAME_DATE", ""))[:10],
+                            "opponent": opponent,
+                            "location": "Home" if home else "Away",
+                            "score": f"{pts_for}-{pts_against}",
+                            "result": str(row.get("WL", "")),
+                            "margin": margin,
+                            "source": "nba_api",
+                        })
+                    wins = sum(1 for g in form if g["result"] == "W")
+                    result = {
+                        "team": team_name, "games_back": len(form),
+                        "record": f"{wins}-{len(form) - wins}",
+                        "win_pct": round(wins / max(len(form), 1), 3),
+                        "avg_margin": round(sum(g["margin"] for g in form) / max(len(form), 1), 1),
+                        "form": form,
+                    }
+                    _set_cache(cache_key, result)
+                    return result
+                except Exception:
+                    continue
 
     # BDL fallback
     team = _resolve_team(team_name)
     if not team:
         return {"error": f"Team not found: {team_name}"}
     season = _current_season()
-    data = _bdl_get("/games", {"seasons[]": season, "team_ids[]": team["id"], "per_page": 100})
+    data = _get_bdl_team_games(team["id"], season)
     form = []
     if "error" not in data:
         finished = [g for g in data.get("data", []) if g.get("status") == "Final"]
@@ -476,7 +582,7 @@ def get_home_away_splits(team_name: str, season: int = None) -> dict:
     team = _resolve_team(team_name)
     if not team:
         return {"error": f"Team not found: {team_name}"}
-    data = _bdl_get("/games", {"seasons[]": season, "team_ids[]": team["id"], "per_page": 100})
+    data = _get_bdl_team_games(team["id"], season)
     if "error" in data:
         return data
     hw = hl = aw = al = 0
@@ -513,45 +619,48 @@ def get_rest_days(team_name: str) -> dict:
     if _NBA_API_AVAILABLE:
         team_id = _nba_team_id(team_name)
         if team_id:
-            try:
-                time.sleep(0.6)
-                ep = TeamGameLog(team_id=team_id, season=_nba_season_str(), timeout=15, headers=_NBA_HEADERS)
-                df = ep.team_game_log.get_data_frame()
-                last_game_date = None
-                last_matchup = ""
-                for _, row in df.iterrows():
-                    try:
-                        from datetime import datetime as _dt
-                        gd = _dt.strptime(str(row.get("GAME_DATE", "")), "%b %d, %Y").date()
-                        if gd < today:
-                            last_game_date = gd
-                            last_matchup = str(row.get("MATCHUP", ""))
-                            break
-                    except Exception:
+            for _, season_str in _nba_season_candidates():
+                try:
+                    time.sleep(0.6)
+                    ep = TeamGameLog(team_id=team_id, season=season_str, timeout=15, headers=_NBA_HEADERS)
+                    df = ep.team_game_log.get_data_frame()
+                    if df.empty:
                         continue
-                result: dict = {"team": team_name}
-                if last_game_date:
-                    rest = (today - last_game_date).days
-                    result.update({
-                        "last_game_date": last_game_date.isoformat(),
-                        "last_game_matchup": last_matchup,
-                        "days_rest": rest,
-                        "fatigue_level": "High" if rest <= 1 else ("Medium" if rest <= 2 else "Low"),
-                        "source": "nba_api",
-                    })
-                else:
-                    result.update({"days_rest": None, "fatigue_level": "Unknown"})
-                _set_cache(cache_key, result)
-                return result
-            except Exception:
-                pass
+                    last_game_date = None
+                    last_matchup = ""
+                    for _, row in df.iterrows():
+                        try:
+                            from datetime import datetime as _dt
+                            gd = _dt.strptime(str(row.get("GAME_DATE", "")), "%b %d, %Y").date()
+                            if gd < today:
+                                last_game_date = gd
+                                last_matchup = str(row.get("MATCHUP", ""))
+                                break
+                        except Exception:
+                            continue
+                    result: dict = {"team": team_name}
+                    if last_game_date:
+                        rest = (today - last_game_date).days
+                        result.update({
+                            "last_game_date": last_game_date.isoformat(),
+                            "last_game_matchup": last_matchup,
+                            "days_rest": rest,
+                            "fatigue_level": "High" if rest <= 1 else ("Medium" if rest <= 2 else "Low"),
+                            "source": "nba_api",
+                        })
+                    else:
+                        result.update({"days_rest": None, "fatigue_level": "Unknown"})
+                    _set_cache(cache_key, result)
+                    return result
+                except Exception:
+                    continue
 
     # BDL fallback
     team = _resolve_team(team_name)
     if not team:
         return {"error": f"Team not found: {team_name}"}
     season = _current_season()
-    data = _bdl_get("/games", {"seasons[]": season, "team_ids[]": team["id"], "per_page": 100})
+    data = _get_bdl_team_games(team["id"], season)
     if "error" in data:
         return data
     games = [g for g in data.get("data", []) if g.get("date")]
@@ -573,14 +682,39 @@ def get_rest_days(team_name: str) -> dict:
 
 
 def get_injury_report(team_name: str) -> dict:
-    """Fetch live injury report from ESPN's free API."""
+    """Fetch live injury report, preferring BallDontLie when the tier allows it."""
     today = date.today().isoformat()
     cache_key = f"injuries_{team_name}_{today}"
     if cached := _cached(cache_key):
         return cached
 
+    team = _resolve_team(team_name)
+    if team:
+        data = _bdl_get("/player_injuries", {"team_ids[]": team["id"], "per_page": 100})
+        if "error" not in data:
+            injuries = []
+            for item in data.get("data", []):
+                player = item.get("player", {})
+                injuries.append({
+                    "player": player.get("first_name", "").strip() + " " + player.get("last_name", "").strip(),
+                    "status": item.get("status", "Unknown"),
+                    "short_note": item.get("return_date", ""),
+                    "detail": item.get("description", ""),
+                    "updated": today,
+                })
+
+            result = {
+                "team": team["full_name"],
+                "source": "bdl_player_injuries",
+                "injuries": injuries,
+                "count": len(injuries),
+                "note": "Live injury data from BallDontLie." if injuries else "No injuries reported for this team.",
+            }
+            _set_cache(cache_key, result)
+            return result
+
     try:
-        r = requests.get(
+        r = _http_session().get(
             "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/injuries",
             timeout=10,
         )
@@ -614,7 +748,7 @@ def get_injury_report(team_name: str) -> dict:
         break  # found the team
 
     result = {
-        "team":     team_name,
+        "team":     team_name if not team else team["full_name"],
         "source":   "espn_live",
         "injuries": injuries,
         "count":    len(injuries),
@@ -764,7 +898,7 @@ def get_advanced_stats(team_name: str) -> dict:
     }
 
     try:
-        r = requests.get(
+        r = _http_session().get(
             "https://stats.nba.com/stats/leaguedashteamstats",
             params={
                 "MeasureType":  "Advanced",
@@ -828,7 +962,7 @@ def get_public_betting_percentages(team_name: str = None) -> dict:
         return cached
 
     try:
-        r = requests.get(
+        r = _http_session().get(
             "https://api.actionnetwork.com/web/v1/games",
             params={"sport": "nba", "date": today.replace("-", "")},
             headers={"User-Agent": "Mozilla/5.0"},

@@ -48,7 +48,7 @@ TS_PATH = os.path.join(_DIR, "data", "csv", "archive (1)", "TeamStatistics.csv")
 # ── Constants ──────────────────────────────────────────────────────────────────
 
 MIN_PRIOR_GAMES = 10       # ignore team rows with fewer prior games
-MIN_TRAIN_SEASON = 2000    # only modern NBA
+MIN_TRAIN_SEASON = 2024    # only last 3 seasons — current-era teams/talent levels
 ELO_K = 20
 ELO_HOME_ADV = 100
 ELO_DEFAULT = 1500.0

@@ -477,7 +477,7 @@ with st.sidebar:
         "Navigation",
         ["🏀 Today", "💬 Chat", "📋 Bet History", "📈 Performance",
          "📄 Daily Reports", "👀 Runner-Up Bets", "🔄 Replaced Bets",
-         "🔍 Bet Reports", "🔌 API Usage", "📊 Model Tracker"],
+         "🔍 Bet Reports", "🔌 API Usage", "📊 Model Tracker", "🎯 Scanner"],
         label_visibility="collapsed",
         key="nav_page",
     )
@@ -1720,6 +1720,153 @@ elif page == "📊 Model Tracker":
             st.caption("If 'Claude > Elo' has a higher win rate, Claude is spotting real edges the model misses. If lower, Claude is overconfident.")
         else:
             st.info("Need bets with both edge values recorded to show calibration.")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TAB — Scanner (Kalshi)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+if page == "🎯 Scanner":
+    import sqlite3 as _sqlite3
+    import os as _os
+
+    KALSHI_DB = _os.path.join(_os.path.dirname(__file__), "kalshi.db")
+
+    st.markdown("### 🎯 Kalshi Scanner")
+
+    live_mode = _os.getenv("KALSHI_LIVE", "False").strip().lower() == "true"
+    ws_mode   = _os.getenv("KALSHI_USE_WEBSOCKET", "False").strip().lower() == "true"
+    mode_label = "LIVE" if live_mode else "PAPER"
+    mode_color = "#22c55e" if live_mode else "#f59e0b"
+    feed_label = "WebSocket" if ws_mode else "Polling"
+
+    st.markdown(
+        f'<span style="background:{mode_color};color:#fff;padding:3px 10px;border-radius:10px;font-size:0.8rem;font-weight:700;">{mode_label}</span>'
+        f'&nbsp;&nbsp;<span style="background:#334155;color:#94a3b8;padding:3px 10px;border-radius:10px;font-size:0.8rem;">{feed_label}</span>',
+        unsafe_allow_html=True,
+    )
+    st.markdown("")
+
+    if not _os.path.exists(KALSHI_DB):
+        st.info("Scanner database not found. Start scanner.py to begin.")
+    else:
+        _conn = _sqlite3.connect(KALSHI_DB)
+        _conn.row_factory = _sqlite3.Row
+
+        # ── Balance from Kalshi ──
+        try:
+            import kalshi as _kalshi
+            import os as _os
+            _is_paper = _os.getenv("KALSHI_LIVE", "False").strip().lower() != "true"
+            _paper_bal = float(_os.getenv("PAPER_BALANCE", "0"))
+            col1, col2 = st.columns(2)
+            if _is_paper and _paper_bal > 0:
+                col1.metric("Kalshi Balance (Paper)", f"${_paper_bal:,.2f}")
+                col2.metric("Portfolio Value", "—")
+            else:
+                _bal = _kalshi.get_balance()
+                if "error" not in _bal:
+                    col1.metric("Kalshi Balance", f"${_bal['balance_dollars']:.2f}")
+                    col2.metric("Portfolio Value", f"${_bal['portfolio_value_dollars']:.2f}")
+        except Exception:
+            pass
+
+        st.divider()
+
+        # ── Open positions ──
+        st.markdown("#### Open Positions")
+        _open = _conn.execute(
+            "SELECT matchup, pick, side, contracts, limit_price_cents, model_prob, implied_prob, edge_pct, dq_score, placed_at "
+            "FROM orders WHERE result IS NULL AND status IN ('placed','paper') ORDER BY placed_at DESC"
+        ).fetchall()
+
+        if _open:
+            _open_rows = []
+            for r in _open:
+                _open_rows.append({
+                    "Matchup":   r["matchup"],
+                    "Pick":      r["pick"],
+                    "Contracts": r["contracts"],
+                    "Price":     f"{r['limit_price_cents']}¢",
+                    "Model":     f"{r['model_prob']*100:.1f}%" if r["model_prob"] else "—",
+                    "Implied":   f"{r['implied_prob']*100:.1f}%" if r["implied_prob"] else "—",
+                    "Edge":      f"{r['edge_pct']:.1f}%" if r["edge_pct"] else "—",
+                    "DQ":        f"{r['dq_score']:.0f}" if r["dq_score"] else "—",
+                    "Placed":    r["placed_at"][:16],
+                })
+            st.dataframe(pd.DataFrame(_open_rows), use_container_width=True, hide_index=True)
+        else:
+            st.caption("No open positions.")
+
+        st.divider()
+
+        # ── P&L summary ──
+        st.markdown("#### Results")
+        _resolved = _conn.execute(
+            "SELECT pick, matchup, result, pnl, limit_price_cents, contracts, placed_at "
+            "FROM orders WHERE result IS NOT NULL ORDER BY placed_at DESC"
+        ).fetchall()
+
+        if _resolved:
+            _wins   = sum(1 for r in _resolved if r["result"] == "win")
+            _losses = sum(1 for r in _resolved if r["result"] == "loss")
+            _total_pnl = sum(r["pnl"] for r in _resolved if r["pnl"] is not None)
+
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Record", f"{_wins}W – {_losses}L")
+            c2.metric("Total P&L", f"${_total_pnl:+.2f}")
+            c3.metric("Win Rate", f"{_wins/max(_wins+_losses,1)*100:.0f}%")
+
+            _res_rows = []
+            for r in _resolved:
+                _res_rows.append({
+                    "Date":      r["placed_at"][:10],
+                    "Matchup":   r["matchup"],
+                    "Pick":      r["pick"],
+                    "Result":    "✅ WIN" if r["result"] == "win" else "❌ LOSS",
+                    "P&L":       f"${r['pnl']:+.2f}" if r["pnl"] is not None else "—",
+                    "Price":     f"{r['limit_price_cents']}¢",
+                    "Contracts": r["contracts"],
+                })
+            st.dataframe(pd.DataFrame(_res_rows), use_container_width=True, hide_index=True)
+        else:
+            st.caption("No resolved bets yet — results update at 2 AM after games finish.")
+
+        st.divider()
+
+        # ── Today's scan log ──
+        st.markdown("#### Today's Scan Log")
+        from datetime import date as _date_cls
+        _today = _date_cls.today().isoformat()
+        _scans = _conn.execute(
+            "SELECT scanned_at, matchup, model_prob, implied_prob, edge_pct, dq_score, decision, reason "
+            "FROM scan_log WHERE scanned_at >= ? ORDER BY scanned_at DESC LIMIT 100",
+            (_today,)
+        ).fetchall()
+
+        if _scans:
+            _scan_rows = []
+            for s in _scans:
+                _scan_rows.append({
+                    "Time":    s["scanned_at"][11:16],
+                    "Matchup": s["matchup"],
+                    "Model":   f"{s['model_prob']*100:.1f}%" if s["model_prob"] else "—",
+                    "Implied": f"{s['implied_prob']*100:.1f}%" if s["implied_prob"] else "—",
+                    "Edge":    f"{s['edge_pct']:.1f}%" if s["edge_pct"] else "—",
+                    "DQ":      f"{s['dq_score']:.0f}" if s["dq_score"] else "—",
+                    "Decision":s["decision"],
+                    "Reason":  s["reason"] or "",
+                })
+            _df_scans = pd.DataFrame(_scan_rows)
+            # Color BET rows
+            st.dataframe(_df_scans, use_container_width=True, hide_index=True)
+        else:
+            st.caption("No scans yet today.")
+
+        _conn.close()
+
+        if st.button("🔄 Refresh"):
+            st.rerun()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

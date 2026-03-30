@@ -6,18 +6,24 @@ Completely separate from the BetIQ paper trading system.
 
 import logging
 import os
+import asyncio
+import json
 from datetime import datetime, timedelta
 from typing import Optional
 
 import pytz
+import requests as _requests
 from dotenv import load_dotenv
 from kalshi_python_sync import Configuration, KalshiClient as _KalshiSDK
+import websockets
 
 load_dotenv()
 
 log = logging.getLogger("betiq.kalshi")
 
 KALSHI_HOST = "https://api.elections.kalshi.com/trade-api/v2"
+KALSHI_WS_URL = os.getenv("KALSHI_WS_URL", "wss://api.elections.kalshi.com/trade-api/ws/v2")
+KALSHI_WS_PATH = "/trade-api/ws/v2"
 NBA_SERIES  = "KXNBAGAME"
 EST         = pytz.timezone("America/New_York")
 
@@ -88,6 +94,39 @@ def resolve_abbrev(team_name: str) -> str | None:
 # ── Client singleton ───────────────────────────────────────────────────────────
 
 _client: Optional[_KalshiSDK] = None
+_auth = None
+
+
+def _http_session() -> _requests.Session:
+    session = _requests.Session()
+    session.trust_env = False
+    return session
+
+
+def _get_auth():
+    """Return a cached KalshiAuth instance for raw HTTP requests."""
+    global _auth
+    if _auth is None:
+        from kalshi_python_sync.auth import KalshiAuth
+        key_path = os.getenv("KALSHI_PRIVATE_KEY_PATH", "kalshi_private_key.pem")
+        with open(key_path, "r") as f:
+            pem = f.read()
+        _auth = KalshiAuth(os.getenv("KALSHI_API_KEY_ID"), pem)
+    return _auth
+
+
+def _raw_get(path: str) -> dict:
+    """Raw authenticated GET to Kalshi API, bypassing SDK pydantic validation."""
+    url = f"{KALSHI_HOST}{path}"
+    headers = _get_auth().create_auth_headers("GET", url)
+    r = _http_session().get(url, headers=headers, timeout=10)
+    r.raise_for_status()
+    return r.json()
+
+
+def create_websocket_headers() -> dict:
+    """Create authenticated WebSocket handshake headers."""
+    return _get_auth().create_auth_headers("GET", KALSHI_WS_PATH)
 
 
 def _get_client() -> _KalshiSDK:
@@ -165,6 +204,18 @@ def get_today_games(include_tomorrow: bool = True) -> list[dict]:
         return []
 
 
+def get_market_tickers_for_games(games: list[dict]) -> list[str]:
+    """Expand Kalshi NBA game events into per-team market tickers."""
+    market_tickers: list[str] = []
+    for game in games:
+        tail = game["event_ticker"].replace("KXNBAGAME-", "")
+        away_abbrev = tail[7:10]
+        home_abbrev = tail[10:13]
+        market_tickers.append(f"{game['event_ticker']}-{away_abbrev}")
+        market_tickers.append(f"{game['event_ticker']}-{home_abbrev}")
+    return market_tickers
+
+
 def get_game_prices(event_ticker: str) -> dict:
     """
     Returns YES bid/ask prices for both teams in a game.
@@ -180,17 +231,17 @@ def get_game_prices(event_ticker: str) -> dict:
     for abbrev in (away_abbrev, home_abbrev):
         market_ticker = f"{event_ticker}-{abbrev}"
         try:
-            resp   = _get_client().get_market(market_ticker)
-            market = resp.market if hasattr(resp, "market") else resp
-            d      = market.to_dict()
-            yes_ask = _safe_float(d.get("yes_ask_dollars"))
-            yes_bid = _safe_float(d.get("yes_bid_dollars"))
+            # Use raw HTTP to avoid SDK pydantic validation failures on null fields
+            data   = _raw_get(f"/markets/{market_ticker}")
+            market = data.get("market", {})
+            yes_ask = _safe_float(market.get("yes_ask_dollars"))
+            yes_bid = _safe_float(market.get("yes_bid_dollars"))
             result[abbrev] = {
                 "ticker":       market_ticker,
                 "yes_bid":      yes_bid,
                 "yes_ask":      yes_ask,
                 "implied_prob": yes_ask,   # 0.51 = 51% implied
-                "volume":       d.get("volume_fp"),
+                "volume":       _safe_float(market.get("volume_fp")),
             }
         except Exception as e:
             log.warning(f"Could not get price for {market_ticker}: {e}")
@@ -275,3 +326,81 @@ def _safe_float(val) -> float | None:
         return float(val) if val is not None else None
     except (TypeError, ValueError):
         return None
+
+
+def build_subscribe_message(
+    message_id: int,
+    channels: list[str],
+    market_tickers: list[str] | None = None,
+) -> dict:
+    params: dict = {"channels": channels}
+    if market_tickers:
+        params["market_tickers"] = market_tickers
+    return {"id": message_id, "cmd": "subscribe", "params": params}
+
+
+def parse_ws_message(message: str) -> dict:
+    return json.loads(message)
+
+
+def extract_ticker_update(payload: dict) -> dict | None:
+    if payload.get("type") != "ticker":
+        return None
+    msg = payload.get("msg", {})
+    market_ticker = msg.get("market_ticker")
+    if not market_ticker:
+        return None
+    event_ticker = market_ticker.rsplit("-", 1)[0]
+    side = market_ticker.rsplit("-", 1)[-1]
+    return {
+        "event_ticker": event_ticker,
+        "market_ticker": market_ticker,
+        "side": side,
+        "yes_bid": _safe_float(msg.get("yes_bid_dollars")),
+        "yes_ask": _safe_float(msg.get("yes_ask_dollars")),
+        "yes_bid_cents": msg.get("yes_bid"),
+        "yes_ask_cents": msg.get("yes_ask"),
+        "volume": _safe_float(msg.get("volume")),
+        "raw": payload,
+    }
+
+
+async def stream_market_updates(
+    market_tickers: list[str],
+    on_message,
+    channels: list[str] | None = None,
+) -> None:
+    """
+    Connect to Kalshi WebSocket and stream updates forever.
+
+    on_message may be sync or async and receives the parsed JSON payload.
+    """
+    channels = channels or ["ticker"]
+    reconnect_delay = 1
+
+    while True:
+        try:
+            headers = create_websocket_headers()
+            async with websockets.connect(
+                KALSHI_WS_URL,
+                additional_headers=headers,
+                proxy=None,
+            ) as websocket:
+                log.info(
+                    f"Kalshi WebSocket connected. Subscribing to {len(market_tickers)} markets on {channels}."
+                )
+                await websocket.send(
+                    json.dumps(build_subscribe_message(1, channels=channels, market_tickers=market_tickers))
+                )
+
+                async for raw_message in websocket:
+                    payload = parse_ws_message(raw_message)
+                    maybe_coro = on_message(payload)
+                    if asyncio.iscoroutine(maybe_coro):
+                        await maybe_coro
+
+            reconnect_delay = 1
+        except Exception as exc:
+            log.warning(f"Kalshi WebSocket disconnected: {exc}. Reconnecting in {reconnect_delay}s...")
+            await asyncio.sleep(reconnect_delay)
+            reconnect_delay = min(reconnect_delay * 2, 30)

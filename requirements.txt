@@ -7,3 +7,4 @@ apscheduler>=3.10.0
 pytz>=2024.1
 fpdf2>=2.7.0
 betfairlightweight>=2.19.0
+websockets>=16.0
